@@ -152,8 +152,18 @@ class MarketDataProvider:
 _provider: MarketDataProvider | None = None
 
 
+def reset_provider(mode: str | None = None) -> MarketDataProvider:
+    """Recreate the singleton (e.g. after reading settings / changing env)."""
+    global _provider
+    if mode is not None:
+        os.environ["MARKET_DATA_MODE"] = mode
+    _provider = MarketDataProvider(mode=mode)
+    return _provider
+
+
 def get_provider() -> MarketDataProvider:
     global _provider
-    if _provider is None:
-        _provider = MarketDataProvider()
+    desired = os.getenv("MARKET_DATA_MODE", "mock").lower()
+    if _provider is None or _provider.mode != desired:
+        _provider = MarketDataProvider(mode=desired)
     return _provider

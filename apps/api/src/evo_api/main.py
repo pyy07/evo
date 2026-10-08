@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from market_data.provider import get_provider, reset_provider
 
 from evo_api.config import get_settings
 from evo_api.db.session import SessionLocal
@@ -11,6 +12,8 @@ from evo_api.services.bootstrap import init_db, seed_capabilities
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    settings = get_settings()
+    reset_provider(settings.market_data_mode)
     init_db()
     db = SessionLocal()
     try:
@@ -41,7 +44,10 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "market_data_mode": get_provider().mode,
+        }
 
     return app
 

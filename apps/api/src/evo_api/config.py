@@ -19,10 +19,17 @@ def _discover_root() -> Path:
 
 
 ROOT = _discover_root()
+_ENV_FILES = tuple(
+    p for p in (str(ROOT / ".env"), ".env") if Path(p).exists()
+) or (".env",)
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=_ENV_FILES,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     database_url: str = f"sqlite:///{ROOT / 'evo.db'}"
     market_data_mode: str = "mock"

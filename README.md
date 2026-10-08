@@ -30,12 +30,30 @@ cd apps/web && npm install && npm run dev
 
 ### 实行情
 
+在仓库根目录 `.env` 设置（API 启动时会读取）：
+
 ```bash
-export MARKET_DATA_MODE=live
-# 依赖：requests pandas（workspace 已包含）
-# 实现来自 a-stock-data SKILL 摘录：tencent_quote / tencent_kline / trading_calendar
-uv run uvicorn evo_api.main:app --app-dir apps/api/src --port 8000
+MARKET_DATA_MODE=live
 ```
+
+然后**重启 API**（改 `.env` 后必须重启才会生效）：
+
+```bash
+uv run uvicorn evo_api.main:app --port 8000
+```
+
+确认：
+
+```bash
+curl -s http://127.0.0.1:8000/health
+# 应看到 "market_data_mode":"live"
+
+curl -s -X POST http://127.0.0.1:8000/capabilities/get_market_snapshot/invoke \
+  -H 'Content-Type: application/json' \
+  -d '{"input":{"codes":["510300"]}}'
+```
+
+`live` 模式通过 `services/market-data` 调用 a-stock-data 摘录（腾讯报价 / K 线、交易日历），机器需能访问对应行情源。失败时 Capability 会报错并提示 `DataGap`。
 
 ### Docker Compose
 

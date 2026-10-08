@@ -5,36 +5,60 @@ Subset: ticker utils, tencent_quote, tencent_kline, trading_calendar.
 """
 from __future__ import annotations
 
+import calendar
 import functools
 import json
+import math
 import re
 import time
-from datetime import datetime, date
+from datetime import date as _date_cls
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any, Optional
 
 import pandas as pd
 import requests
 
+# From a-stock-data SKILL.md (§v39 HTTP helpers)
+V39_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
 V39_RETRY_SESSION = requests.Session()
 try:
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
-    _v39_retry_adapter = HTTPAdapter(max_retries=Retry(
-        total=3, connect=3, backoff_factor=0.6, respect_retry_after_header=False,
-        status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"]))
+
+    _v39_retry_adapter = HTTPAdapter(
+        max_retries=Retry(
+            total=3,
+            connect=3,
+            backoff_factor=0.6,
+            respect_retry_after_header=False,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+    )
     V39_RETRY_SESSION.mount("https://", _v39_retry_adapter)
     V39_RETRY_SESSION.mount("http://", _v39_retry_adapter)
 except Exception:
-    # 老版本 urllib3（< 1.26）缺 allowed_methods：不重试，也不复用连接（复用的连接被服务端断开时没有重试兜底），同 v3.10.0
+    # 老版本 urllib3（< 1.26）缺 allowed_methods：不重试
     V39_RETRY_SESSION = None
 
 
-def _v39_http(url, params=None, data=None, headers=None, method="GET", timeout=(10, 40),
-              allow_status=(), allow_redirects=True, session=None):
-    """非东财的 HTTP 请求：带浏览器 UA。网络错误、非 2xx 一律抛 RuntimeError（不把错误页当数据）；
-    allow_status 里的状态码（源用 404 表示「当天没发布」时）原样返回，由调用方判断。
-    session：传 V39_RETRY_SESSION 复用连接并自动重试（哪些情况重试见它的定义）；不传每次新建连接、不重试。"""
+def _v39_http(
+    url,
+    params=None,
+    data=None,
+    headers=None,
+    method="GET",
+    timeout=(10, 40),
+    allow_status=(),
+    allow_redirects=True,
+    session=None,
+):
+    """非东财的 HTTP 请求：带浏览器 UA。"""
     merged = {"User-Agent": V39_UA}
     merged.update(headers or {})
     try:
