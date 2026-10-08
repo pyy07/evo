@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: evo
+      POSTGRES_PASSWORD: evo
+      POSTGRES_DB: evo
+    ports:
+      - "5432:5432"
+    volumes:
+      - evo_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evo -d evo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://evo:evo@db:5432/evo
+      MARKET_DATA_MODE: mock
+      ADMIN_TOKEN: dev-admin-token
+      INITIAL_CASH: "1000000"
+      CORS_ORIGINS: "http://localhost:5173,http://localhost:3000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    environment:
+      VITE_API_BASE: http://localhost:8000
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+volumes:
+  evo_pg:

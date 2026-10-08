@@ -1,0 +1,149 @@
+:root {
+  --bg: #0f1419;
+  --panel: #1a222c;
+  --text: #e7eef7;
+  --muted: #8fa3b8;
+  --accent: #3d9cf0;
+  --ok: #3ecf8e;
+  --warn: #f0b429;
+  --border: #2a3542;
+  font-family: "IBM Plex Sans", "Source Han Sans SC", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(1200px 600px at 10% -10%, #1b2a3a, var(--bg));
+  color: var(--text);
+  min-height: 100vh;
+}
+
+header {
+  padding: 1.25rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 1.25rem;
+  letter-spacing: 0.02em;
+}
+
+header p {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.token-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+input,
+button,
+select,
+textarea {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.45rem 0.7rem;
+}
+
+button {
+  cursor: pointer;
+  background: #243141;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #041018;
+  font-weight: 600;
+}
+
+main {
+  padding: 1.25rem 1.5rem 2rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1rem;
+}
+
+.card {
+  background: color-mix(in srgb, var(--panel) 92%, black);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem;
+}
+
+.card h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.65rem 0.75rem;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.item strong {
+  display: block;
+  margin-bottom: 0.25rem;
+}
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  background: #2b3948;
+}
+
+.badge.ok {
+  background: color-mix(in srgb, var(--ok) 30%, #1a222c);
+}
+
+.badge.warn {
+  background: color-mix(in srgb, var(--warn) 35%, #1a222c);
+}
+
+.error {
+  color: #ff8f8f;
+  white-space: pre-wrap;
+}
