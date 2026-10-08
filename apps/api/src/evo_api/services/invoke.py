@@ -31,7 +31,7 @@ class CapabilityError(Exception):
 
 def _require(payload: dict[str, Any], key: str) -> Any:
     if key not in payload:
-        raise CapabilityError(f"missing required field: {key}")
+        raise CapabilityError(f"缺少必填字段：{key}")
     return payload[key]
 
 
@@ -45,13 +45,13 @@ def invoke_capability(
     payload = payload or {}
     cap = db.get(Capability, capability_id)
     if not cap or cap.status != CapabilityStatus.active:
-        raise CapabilityError(f"capability not found or inactive: {capability_id}", 404)
+        raise CapabilityError(f"能力不存在或未启用：{capability_id}", 404)
 
     # Minimal required-field check from JSON schema
     required = (cap.input_schema or {}).get("required") or []
     for key in required:
         if key not in payload:
-            raise CapabilityError(f"invalid input: missing {key}")
+            raise CapabilityError(f"输入无效：缺少字段 {key}")
 
     try:
         result = _dispatch(db, cap.implementation or capability_id, payload)
@@ -81,7 +81,7 @@ def invoke_capability(
     )
     db.commit()
     if not success:
-        raise CapabilityError(error or "capability failed", 502)
+        raise CapabilityError(error or "能力调用失败", 502)
     return result
 
 
@@ -185,10 +185,10 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
         if create_cr:
             if issue_type not in (IssueType.CapabilityGap, IssueType.DataGap):
                 raise CapabilityError(
-                    "change requests only allowed for CapabilityGap or DataGap"
+                    "仅 CapabilityGap 或 DataGap 可创建变更请求"
                 )
             cr_body = payload.get("change_request") or {
-                "title": f"{issue_type.value}: auto from review",
+                "title": f"{issue_type.value}：来自复盘的自动变更请求",
                 "problem": payload.get("content"),
                 "issue_type": issue_type.value,
             }
@@ -218,7 +218,7 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
             db.add(
                 Outcome(
                     decision_id=payload["decision_id"],
-                    summary=f"Reviewed as {issue_type.value}",
+                    summary=f"已复盘，问题类型：{issue_type.value}",
                     metrics={"review_id": review.id},
                 )
             )
@@ -227,7 +227,7 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
     if impl == "create_change_request":
         issue_type = IssueType(_require(payload, "issue_type"))
         if issue_type not in (IssueType.CapabilityGap, IssueType.DataGap):
-            raise CapabilityError("issue_type must be CapabilityGap or DataGap")
+            raise CapabilityError("issue_type 只能是 CapabilityGap 或 DataGap")
         cr = ChangeRequest(
             title=_require(payload, "title"),
             problem=_require(payload, "problem"),
@@ -270,7 +270,7 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
     if impl == "finish_agent_run":
         run = db.get(AgentRun, _require(payload, "agent_run_id"))
         if not run:
-            raise CapabilityError("agent_run not found", 404)
+            raise CapabilityError("找不到对应的 AgentRun", 404)
         run.status = payload.get("status") or "completed"
         run.notes = payload.get("notes") or run.notes
         run.finished_at = datetime.now(timezone.utc)
@@ -280,4 +280,4 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
     if impl == "noop":
         return {"status": "noop", "echo": payload}
 
-    raise CapabilityError(f"no implementation for {impl}", 500)
+    raise CapabilityError(f"未实现的能力：{impl}", 500)

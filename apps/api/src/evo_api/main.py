@@ -22,7 +22,12 @@ async def lifespan(_: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="Evo Investment System", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(
+        title="Evo 自演进投资系统",
+        description="投资决策闭环 · Capability 注册 · 纸面交易 · 人工监督演进",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
     origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,

@@ -1,4 +1,4 @@
-"""Seed definitions for phase-1 capabilities."""
+"""第一期 Capability 种子定义。"""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from typing import Any
 CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "list_capabilities",
-        "name": "List Capabilities",
-        "description": "List active system capabilities",
+        "name": "列出系统能力",
+        "description": "列出当前可用的系统 Capability",
         "category": "system",
         "input_schema": {"type": "object", "properties": {}},
         "output_schema": {"type": "object"},
@@ -17,8 +17,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "get_market_snapshot",
-        "name": "Get Market Snapshot",
-        "description": "Fetch ETF/index snapshot quotes via market-data (a-stock-data)",
+        "name": "获取行情快照",
+        "description": "通过 market-data（a-stock-data）获取 ETF/指数快照报价",
         "category": "market",
         "input_schema": {
             "type": "object",
@@ -31,8 +31,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "get_etf_history",
-        "name": "Get ETF History",
-        "description": "Fetch ETF OHLCV history",
+        "name": "获取 ETF 历史行情",
+        "description": "获取 ETF 的 OHLCV 历史 K 线",
         "category": "market",
         "input_schema": {
             "type": "object",
@@ -50,8 +50,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "get_trading_calendar",
-        "name": "Get Trading Calendar",
-        "description": "Official-ish trading calendar for a month",
+        "name": "获取交易日历",
+        "description": "获取指定年月的交易日历",
         "category": "market",
         "input_schema": {
             "type": "object",
@@ -67,8 +67,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "submit_observation",
-        "name": "Submit Observation",
-        "description": "Record a market observation",
+        "name": "提交市场观察",
+        "description": "记录一条市场观察（请使用中文）",
         "category": "decision",
         "input_schema": {
             "type": "object",
@@ -85,8 +85,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "submit_thesis",
-        "name": "Submit Thesis",
-        "description": "Record an investment thesis",
+        "name": "提交投资论点",
+        "description": "记录投资论点（请使用中文）",
         "category": "decision",
         "input_schema": {
             "type": "object",
@@ -103,8 +103,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "submit_decision",
-        "name": "Submit Decision",
-        "description": "Record an investment decision linked to observation/thesis",
+        "name": "提交投资决策",
+        "description": "记录投资决策并关联观察/论点（摘要与假设请使用中文）",
         "category": "decision",
         "input_schema": {
             "type": "object",
@@ -124,8 +124,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "submit_order",
-        "name": "Submit Order",
-        "description": "Paper-trade order (simulated fill)",
+        "name": "提交模拟订单",
+        "description": "纸面交易下单（模拟成交）",
         "category": "execution",
         "input_schema": {
             "type": "object",
@@ -144,8 +144,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "get_portfolio",
-        "name": "Get Portfolio",
-        "description": "Cash, positions, and latest snapshot",
+        "name": "查询投资组合",
+        "description": "查询现金、持仓与最新快照",
         "category": "portfolio",
         "input_schema": {"type": "object", "properties": {}},
         "output_schema": {"type": "object"},
@@ -154,8 +154,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "submit_review",
-        "name": "Submit Review",
-        "description": "Review a decision with mandatory issue classification",
+        "name": "提交复盘",
+        "description": "对决策复盘，必须标注问题类型（复盘正文请使用中文）",
         "category": "review",
         "input_schema": {
             "type": "object",
@@ -183,8 +183,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "create_change_request",
-        "name": "Create Change Request",
-        "description": "Propose a system capability/data improvement",
+        "name": "创建变更请求",
+        "description": "提出系统能力/数据改进建议（正文请使用中文）",
         "category": "evolution",
         "input_schema": {
             "type": "object",
@@ -207,8 +207,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "list_change_requests",
-        "name": "List Change Requests",
-        "description": "List system change requests",
+        "name": "列出变更请求",
+        "description": "列出系统变更请求",
         "category": "evolution",
         "input_schema": {
             "type": "object",
@@ -220,8 +220,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "start_agent_run",
-        "name": "Start Agent Run",
-        "description": "Open an agent run record",
+        "name": "开始 Agent 运行",
+        "description": "创建一条 AgentRun 记录",
         "category": "system",
         "input_schema": {
             "type": "object",
@@ -233,8 +233,8 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "finish_agent_run",
-        "name": "Finish Agent Run",
-        "description": "Close an agent run record",
+        "name": "结束 Agent 运行",
+        "description": "关闭一条 AgentRun 记录",
         "category": "system",
         "input_schema": {
             "type": "object",

@@ -48,14 +48,14 @@ def get_price(symbol: str) -> float:
     try:
         quotes = provider.get_market_snapshot([symbol])
     except MarketDataError as exc:
-        raise ValueError(f"market data unavailable: {exc}") from exc
+        raise ValueError(f"行情不可用：{exc}") from exc
     q = quotes.get(symbol) or next(iter(quotes.values()), None)
     if not q:
-        raise ValueError(f"no quote for {symbol}")
+        raise ValueError(f"找不到报价：{symbol}")
     for key in ("price", "current", "last", "close"):
         if key in q and q[key] is not None:
             return float(q[key])
-    raise ValueError(f"quote missing price for {symbol}: {q}")
+    raise ValueError(f"报价缺少价格字段：{symbol} → {q}")
 
 
 def portfolio_view(db: Session) -> dict[str, Any]:
@@ -116,21 +116,21 @@ def submit_order(
     rules = etf_rules()
     lot = float(rules.get("lot_size", 100))
     if quantity <= 0:
-        raise ValueError("quantity must be positive")
+        raise ValueError("数量必须为正数")
     if quantity % lot != 0:
-        raise ValueError(f"quantity must be multiple of lot_size={lot}")
+        raise ValueError(f"数量必须是手数单位 {lot} 的整数倍")
     if not looks_like_etf(symbol):
-        raise ValueError(f"{symbol} does not look like an A-share ETF under kind rules")
+        raise ValueError(f"{symbol} 不符合 A股 ETF 品种规则")
     if side not in ("buy", "sell"):
-        raise ValueError("side must be buy or sell")
+        raise ValueError("买卖方向只能是 buy 或 sell")
     if side == "sell" and rules.get("allow_short") is False:
         pos = db.query(Position).filter_by(symbol=symbol).one_or_none()
         if not pos or pos.quantity < quantity:
-            raise ValueError("insufficient position; shorting disabled for ETF")
+            raise ValueError("持仓不足，且 ETF 不允许做空")
 
     acct = ensure_account(db)
     if not acct.paper:
-        raise ValueError("live trading is disabled in phase 1")
+        raise ValueError("一期禁止实盘交易")
 
     price = get_price(symbol)
     notional = price * quantity
@@ -151,7 +151,7 @@ def submit_order(
         cost = notional + commission
         if acct.cash < cost:
             order.status = OrderStatus.rejected
-            order.reason = "insufficient cash"
+            order.reason = "现金不足"
             db.add(order)
             db.flush()
             return {"order_id": order.id, "status": order.status.value, "reason": order.reason}

@@ -7,7 +7,7 @@ paper_trading_only: true
 
 kinds:
   etf:
-    description: A-share ETF
+    description: A股 ETF
     allow_short: false
     lot_size: 100
     commission_rate: 0.0001

@@ -65,7 +65,7 @@ export default function App() {
     await api(`/admin/change-requests/${id}/approve`, {
       token,
       method: "POST",
-      body: { notes: "approved via web" },
+      body: { notes: "监督台审批通过" },
     });
     await refresh();
   }
@@ -74,7 +74,7 @@ export default function App() {
     await api(`/admin/change-requests/${id}/reject`, {
       token,
       method: "POST",
-      body: { notes: "rejected via web" },
+      body: { notes: "监督台驳回" },
     });
     await refresh();
   }
@@ -88,9 +88,9 @@ export default function App() {
       body: {
         capability_id,
         name: draft.name || capability_id,
-        description: draft.description || "Registered after human implementation",
+        description: draft.description || "人工实现后登记的能力",
         implementation: "noop",
-        notes: "implemented via web",
+        notes: "已通过监督台标记为已实现",
       },
     });
     await refresh();
@@ -225,9 +225,9 @@ export default function App() {
                   {cr.status === "proposed" ? (
                     <div className="row">
                       <button className="primary" onClick={() => approve(cr.id)}>
-                        Approve
+                        通过
                       </button>
-                      <button onClick={() => reject(cr.id)}>Reject</button>
+                      <button onClick={() => reject(cr.id)}>驳回</button>
                     </div>
                   ) : null}
                   {cr.status === "approved" ? (
@@ -253,7 +253,7 @@ export default function App() {
                         }
                       />
                       <button className="primary" onClick={() => implement(cr.id)}>
-                        Mark Implemented + Register Capability
+                        标记已实现并登记能力
                       </button>
                     </div>
                   ) : null}

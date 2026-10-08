@@ -25,7 +25,7 @@ def require_admin(authorization: str | None = Header(default=None)) -> None:
     settings = get_settings()
     token = settings.admin_token
     if not authorization or authorization.removeprefix("Bearer ").strip() != token:
-        raise HTTPException(status_code=401, detail="unauthorized")
+        raise HTTPException(status_code=401, detail="未授权")
 
 
 class ApproveBody(BaseModel):
@@ -138,9 +138,9 @@ def approve_cr(
 ) -> dict[str, Any]:
     cr = db.get(ChangeRequest, cr_id)
     if not cr:
-        raise HTTPException(404, "not found")
+        raise HTTPException(404, "未找到变更请求")
     if cr.status != ChangeRequestStatus.proposed:
-        raise HTTPException(400, f"cannot approve from status {cr.status.value}")
+        raise HTTPException(400, f"当前状态不可审批：{cr.status.value}")
     cr.status = ChangeRequestStatus.approved
     cr.review_notes = body.notes
     db.commit()
@@ -156,7 +156,7 @@ def reject_cr(
 ) -> dict[str, Any]:
     cr = db.get(ChangeRequest, cr_id)
     if not cr:
-        raise HTTPException(404, "not found")
+        raise HTTPException(404, "未找到变更请求")
     cr.status = ChangeRequestStatus.rejected
     cr.review_notes = body.notes
     db.commit()
@@ -173,11 +173,11 @@ def implement_cr(
     """Human marks CR implemented and registers a new Capability (code still manual)."""
     cr = db.get(ChangeRequest, cr_id)
     if not cr:
-        raise HTTPException(404, "not found")
+        raise HTTPException(404, "未找到变更请求")
     if cr.status != ChangeRequestStatus.approved:
-        raise HTTPException(400, "CR must be approved before implement")
+        raise HTTPException(400, "须先审批通过才能标记实现")
     if db.get(Capability, body.capability_id):
-        raise HTTPException(400, "capability_id already exists")
+        raise HTTPException(400, "capability_id 已存在")
     cap = Capability(
         id=body.capability_id,
         name=body.name,
