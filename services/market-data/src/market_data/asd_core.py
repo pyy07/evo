@@ -1,7 +1,7 @@
 """Core market-data helpers adapted from simonlin1212/a-stock-data (Apache-2.0).
 
 Source: https://github.com/simonlin1212/a-stock-data
-Subset: ticker utils, tencent_quote, tencent_kline, trading_calendar.
+Subset: ticker utils, tencent_quote, tencent_kline, trading_calendar, index_valuation.
 """
 from __future__ import annotations
 
@@ -628,6 +628,36 @@ def _official_index_members(index_code, provider, weights):
                     or not 99 <= frame.weight_percent.sum() <= 101):
         raise RuntimeError("权重范围或合计异常；可能文件残缺或不是百分数口径")
     return frame
+
+
+def index_valuation(index_code):
+    """中证近期 PE/股息率文件；不含 PB，两种股本口径不混用。"""
+    index_code = _official_code(index_code)
+    url = (
+        "https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/file/"
+        f"autofile/indicator/{index_code}indicator.xls"
+    )
+    response = _official_get(url)
+    data = _official_excel(response)
+    mapping = {
+        "市盈率1（总股本）P/E1": "pe_total",
+        "市盈率2（计算用股本）P/E2": "pe_calculation",
+        "股息率1（总股本）D/P1": "dividend_yield_total_percent",
+        "股息率2（计算用股本）D/P2": "dividend_yield_calculation_percent",
+    }
+    _official_columns(data, ["日期Date", "指数代码IndexCode", *mapping])
+    rows = []
+    for rec in data.to_dict("records"):
+        if str(rec["指数代码IndexCode"]).zfill(6) != index_code:
+            raise RuntimeError("中证估值文件返回了不同指数")
+        rows.append(
+            {
+                "date": _official_date(rec["日期Date"]),
+                "index_code": index_code,
+                **{dest: _official_number(rec[src]) for src, dest in mapping.items()},
+            }
+        )
+    return _official_frame(rows, ["date", "index_code"], "csi", response.url)
 
 
 def trading_calendar(year, month):

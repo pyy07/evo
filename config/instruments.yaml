@@ -1,18 +1,60 @@
-# Investment instrument kind rules (not a symbol whitelist).
-# All A-share ETFs are investable; behavior is constrained by kind config.
+# 品种规则 + 选股宇宙。用 stock_type 切换资产类型，而不是绑死单一代码。
 
 default_cash: 1_000_000.0
 currency: CNY
 paper_trading_only: true
 
+# 可选：stock | etf | convertible_bond（也可被环境变量 STOCK_TYPE 覆盖）
+default_stock_type: etf
+
+# 个股宇宙用的指数（仅 stock_type=stock 时生效；也可被 UNIVERSE_INDEX 覆盖）
+universe_index: "000300"
+
 kinds:
+  stock:
+    description: A股个股（沪深北）
+    allow_short: false
+    lot_size: 100
+    commission_rate: 0.00025
+    min_commission: 5.0
+    code_prefixes:
+      - "000"
+      - "001"
+      - "002"
+      - "003"
+      - "300"
+      - "301"
+      - "600"
+      - "601"
+      - "603"
+      - "605"
+      - "688"
+      - "689"
+      - "830"
+      - "831"
+      - "832"
+      - "833"
+      - "834"
+      - "835"
+      - "836"
+      - "837"
+      - "838"
+      - "839"
+      - "870"
+      - "871"
+      - "872"
+      - "873"
+      - "920"
+    universe:
+      source: index
+      index_code: "000300"
+
   etf:
     description: A股 ETF
     allow_short: false
     lot_size: 100
     commission_rate: 0.0001
     min_commission: 0.0
-    # Heuristic: common A-share ETF code prefixes (validated softly at order time)
     code_prefixes:
       - "15"
       - "16"
@@ -32,3 +74,55 @@ kinds:
       - "562"
       - "563"
       - "588"
+    universe:
+      source: market
+      # mock / 行情失败时的种子池
+      seed_codes:
+        - {code: "510300", name: "沪深300ETF"}
+        - {code: "510500", name: "中证500ETF"}
+        - {code: "159915", name: "创业板ETF"}
+        - {code: "588000", name: "科创50ETF"}
+        - {code: "512100", name: "1000ETF"}
+        - {code: "513100", name: "纳指ETF"}
+        - {code: "513500", name: "标普500ETF"}
+        - {code: "511010", name: "国债ETF"}
+        - {code: "518880", name: "黄金ETF"}
+        - {code: "512480", name: "半导体ETF"}
+        - {code: "159819", name: "人工智能ETF"}
+        - {code: "512880", name: "证券ETF"}
+        - {code: "512690", name: "酒ETF"}
+        - {code: "159992", name: "创新药ETF"}
+        - {code: "515790", name: "光伏ETF"}
+        - {code: "516160", name: "新能源ETF"}
+        - {code: "512010", name: "医药ETF"}
+        - {code: "512660", name: "军工ETF"}
+        - {code: "159985", name: "豆粕ETF"}
+        - {code: "511880", name: "银华日利"}
+
+  convertible_bond:
+    description: 可转债
+    allow_short: false
+    lot_size: 10
+    commission_rate: 0.0001
+    min_commission: 0.0
+    code_prefixes:
+      - "11"
+      - "12"
+    universe:
+      source: market
+      seed_codes:
+        - {code: "110059", name: "浦发转债"}
+        - {code: "113052", name: "兴业转债"}
+        - {code: "113044", name: "大族转债"}
+        - {code: "127045", name: "牧原转债"}
+        - {code: "123107", name: "温氏转债"}
+        - {code: "128136", name: "立讯转债"}
+        - {code: "113050", name: "南银转债"}
+        - {code: "110085", name: "通22转债"}
+        - {code: "118031", name: "天23转债"}
+        - {code: "127073", name: "天赐转债"}
+        - {code: "123158", name: "宙邦转债"}
+        - {code: "113066", name: "平银转债"}
+        - {code: "110081", name: "闻泰转债"}
+        - {code: "127061", name: "美锦转债"}
+        - {code: "123119", name: "康泰转2"}

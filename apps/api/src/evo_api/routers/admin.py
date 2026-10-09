@@ -33,18 +33,18 @@ class ApproveBody(BaseModel):
 
 
 class RejectBody(BaseModel):
-    notes: str | None = None
+    notes: str = Field(..., min_length=1)
 
 
 class ImplementBody(BaseModel):
-    capability_id: str
-    name: str
+    notes: str | None = None
+    capability_id: str | None = None
+    name: str | None = None
     description: str = ""
     category: str = "custom"
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
     implementation: str = "noop"
-    notes: str | None = None
 
 
 @router.get("/timeline")
@@ -75,6 +75,7 @@ def timeline(
                 "summary": d.summary,
                 "hypothesis": d.hypothesis,
                 "action_plan": d.action_plan,
+                "usage_notes": d.usage_notes or [],
                 "agent_run_id": d.agent_run_id,
                 "observation_id": d.observation_id,
                 "thesis_id": d.thesis_id,
@@ -104,6 +105,18 @@ def portfolio(
     return portfolio_svc.portfolio_view(db)
 
 
+@router.get("/desk")
+def desk(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    """Account + today's decisions/orders for the main desk view."""
+    return {
+        "portfolio": portfolio_svc.portfolio_view(db),
+        "today": portfolio_svc.desk_today(db),
+    }
+
+
 @router.get("/change-requests")
 def list_crs(
     db: Session = Depends(get_db),
@@ -122,6 +135,7 @@ def list_crs(
                 "issue_type": r.issue_type.value,
                 "status": r.status.value,
                 "review_notes": r.review_notes,
+                "verification_notes": r.verification_notes,
                 "implemented_capability_id": r.implemented_capability_id,
             }
             for r in rows
@@ -141,7 +155,7 @@ def approve_cr(
         raise HTTPException(404, "未找到变更请求")
     if cr.status != ChangeRequestStatus.proposed:
         raise HTTPException(400, f"当前状态不可审批：{cr.status.value}")
-    cr.status = ChangeRequestStatus.approved
+    cr.status = ChangeRequestStatus.pending_dev
     cr.review_notes = body.notes
     db.commit()
     return {"id": cr.id, "status": cr.status.value}
@@ -157,8 +171,14 @@ def reject_cr(
     cr = db.get(ChangeRequest, cr_id)
     if not cr:
         raise HTTPException(404, "未找到变更请求")
+    if cr.status not in (
+        ChangeRequestStatus.proposed,
+        ChangeRequestStatus.pending_dev,
+        ChangeRequestStatus.approved,
+    ):
+        raise HTTPException(400, f"当前状态不可拒绝：{cr.status.value}")
     cr.status = ChangeRequestStatus.rejected
-    cr.review_notes = body.notes
+    cr.review_notes = body.notes.strip()
     db.commit()
     return {"id": cr.id, "status": cr.status.value}
 
@@ -170,35 +190,37 @@ def implement_cr(
     db: Session = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Human marks CR implemented and registers a new Capability (code still manual)."""
+    """Mark CR development complete. Registering a Capability is optional."""
     cr = db.get(ChangeRequest, cr_id)
     if not cr:
         raise HTTPException(404, "未找到变更请求")
-    if cr.status != ChangeRequestStatus.approved:
-        raise HTTPException(400, "须先审批通过才能标记实现")
-    if db.get(Capability, body.capability_id):
-        raise HTTPException(400, "capability_id 已存在")
-    cap = Capability(
-        id=body.capability_id,
-        name=body.name,
-        description=body.description,
-        category=body.category,
-        input_schema=body.input_schema,
-        output_schema=body.output_schema,
-        permission="agent",
-        implementation=body.implementation,
-        status=CapabilityStatus.active,
-    )
-    db.add(cap)
-    cr.status = ChangeRequestStatus.implemented
-    cr.implemented_capability_id = body.capability_id
-    cr.capability_payload = body.model_dump()
+    if cr.status not in (ChangeRequestStatus.pending_dev, ChangeRequestStatus.approved):
+        raise HTTPException(400, "须处于待开发状态才能标记完成")
+    capability_id = (body.capability_id or "").strip() or None
+    if capability_id:
+        if db.get(Capability, capability_id):
+            raise HTTPException(400, "capability_id 已存在")
+        cap = Capability(
+            id=capability_id,
+            name=(body.name or "").strip() or capability_id,
+            description=body.description,
+            category=body.category,
+            input_schema=body.input_schema,
+            output_schema=body.output_schema,
+            permission="agent",
+            implementation=body.implementation,
+            status=CapabilityStatus.active,
+        )
+        db.add(cap)
+        cr.implemented_capability_id = capability_id
+        cr.capability_payload = body.model_dump()
+    cr.status = ChangeRequestStatus.completed
     cr.review_notes = body.notes or cr.review_notes
     db.commit()
     return {
         "id": cr.id,
         "status": cr.status.value,
-        "capability_id": body.capability_id,
+        "capability_id": cr.implemented_capability_id,
     }
 
 

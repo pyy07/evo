@@ -18,7 +18,10 @@ CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "get_market_snapshot",
         "name": "获取行情快照",
-        "description": "通过 market-data（a-stock-data）获取 ETF/指数快照报价",
+        "description": (
+            "获取 ETF/个股/指数快照。codes 应来自持仓、screen_market/list_universe 候选，"
+            "或明确的大盘指数（指数请带市场前缀，如 sh000001）；不要传入无依据的固定观察池。"
+        ),
         "category": "market",
         "input_schema": {
             "type": "object",
@@ -31,14 +34,17 @@ CAPABILITIES: list[dict[str, Any]] = [
     },
     {
         "id": "get_etf_history",
-        "name": "获取 ETF 历史行情",
-        "description": "获取 ETF 的 OHLCV 历史 K 线",
+        "name": "获取历史K线",
+        "description": (
+            "获取个股或 ETF 最近 N 根 OHLCV（默认最近 20 根、最多 40）。"
+            "返回 latest + 时间正序 bars（最后一根为最新）；不要把 count 开很大。"
+        ),
         "category": "market",
         "input_schema": {
             "type": "object",
             "properties": {
                 "code": {"type": "string"},
-                "count": {"type": "integer", "default": 60},
+                "count": {"type": "integer", "default": 20, "description": "最近 N 根，最大 40"},
                 "period": {"type": "string", "default": "day"},
                 "adjust": {"type": "string", "default": "qfq"},
             },
@@ -64,6 +70,202 @@ CAPABILITIES: list[dict[str, Any]] = [
         "output_schema": {"type": "object"},
         "permission": "agent",
         "implementation": "get_trading_calendar",
+    },
+    {
+        "id": "get_market_session",
+        "name": "获取当前交易时段",
+        "description": "返回 A 股交易日/盘中/午休/盘后状态（Asia/Shanghai）",
+        "category": "market",
+        "input_schema": {"type": "object", "properties": {}},
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_market_session",
+    },
+    {
+        "id": "list_universe",
+        "name": "列出选股宇宙",
+        "description": "按 stock_type（stock/etf/convertible_bond）列出可选标的",
+        "category": "market",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stock_type": {
+                    "type": "string",
+                    "enum": ["stock", "etf", "convertible_bond"],
+                },
+                "index_code": {"type": "string", "default": "000300"},
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "list_universe",
+    },
+    {
+        "id": "screen_market",
+        "name": "全市场筛选",
+        "description": "按资产类型筛选候选（ETF/可转债/个股），按涨跌幅绝对值排序",
+        "category": "market",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stock_type": {
+                    "type": "string",
+                    "enum": ["stock", "etf", "convertible_bond"],
+                },
+                "index_code": {"type": "string", "default": "000300"},
+                "top_n": {"type": "integer", "default": 30},
+                "extra_codes": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "screen_market",
+    },
+    {
+        "id": "get_market_overview",
+        "name": "大盘综合信息",
+        "description": (
+            "盘中大盘综合快照：主要指数、沪深300估值、行业/概念涨跌、行业资金流向、"
+            "全市场涨跌分布。行业等分项失败会降级保留其余字段，不会整包 502。"
+            "看大盘时应优先调用本能力。"
+        ),
+        "category": "market",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "top_n": {"type": "integer", "default": 8, "description": "行业/概念/资金流各取前 N"},
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_market_overview",
+    },
+    {
+        "id": "get_industry_ranking",
+        "name": "行业/概念涨跌排名",
+        "description": "行业或概念板块涨跌幅排名（a-stock-data industry_comparison）",
+        "category": "market",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "board": {
+                    "type": "string",
+                    "enum": ["industry", "concept"],
+                    "default": "industry",
+                },
+                "top_n": {"type": "integer", "default": 10},
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_industry_ranking",
+    },
+    {
+        "id": "get_board_fund_flow",
+        "name": "板块资金流向",
+        "description": "行业/概念/地域板块主力资金流向（a-stock-data board_fund_flow）",
+        "category": "market",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "board_type": {
+                    "type": "string",
+                    "enum": ["industry", "concept", "region"],
+                    "default": "industry",
+                },
+                "period": {
+                    "type": "string",
+                    "enum": ["today", "5d", "10d"],
+                    "default": "today",
+                },
+                "top_n": {"type": "integer", "default": 10},
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_board_fund_flow",
+    },
+    {
+        "id": "get_index_valuation",
+        "name": "指数/ETF估值",
+        "description": (
+            "指数或宽基 ETF 的 PE/PB/PE分位。ETF 快照 pe_ttm/pb 常为 0，"
+            "请把 510300 等映射到 000300 后调用本能力，不要用个股字段当指数估值。"
+        ),
+        "category": "market",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "指数或 ETF 代码，如 000300 / 510300",
+                },
+            },
+            "required": ["code"],
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_index_valuation",
+    },
+    {
+        "id": "get_market_breadth",
+        "name": "全市场涨跌分布",
+        "description": "A 股涨跌家数与涨跌幅分布直方图（东财 ZDFenBu + 上证/深证涨跌家数）",
+        "category": "market",
+        "input_schema": {"type": "object", "properties": {}},
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_market_breadth",
+    },
+    {
+        "id": "take_portfolio_snapshot",
+        "name": "记录组合快照",
+        "description": "写入一笔组合估值快照（盘后结算用）",
+        "category": "portfolio",
+        "input_schema": {"type": "object", "properties": {}},
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "take_portfolio_snapshot",
+    },
+    {
+        "id": "settle_day",
+        "name": "日终清算",
+        "description": "盘后清算：按最新行情估值、写入快照，汇总当日盈亏/持仓/成交/决策",
+        "category": "portfolio",
+        "input_schema": {"type": "object", "properties": {}},
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "settle_day",
+    },
+    {
+        "id": "get_day_report",
+        "name": "获取当日清算日报",
+        "description": "读取当日组合盈亏、持仓、最近快照与精简决策/订单摘要（复盘用）",
+        "category": "portfolio",
+        "input_schema": {"type": "object", "properties": {}},
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_day_report",
+    },
+    {
+        "id": "list_today_decisions",
+        "name": "列出当日决策",
+        "description": "列出当日投资决策摘要（不含完整工具调用明细）",
+        "category": "decision",
+        "input_schema": {"type": "object", "properties": {}},
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "list_today_decisions",
+    },
+    {
+        "id": "list_today_orders",
+        "name": "列出当日订单成交",
+        "description": "列出当日订单与成交记录",
+        "category": "execution",
+        "input_schema": {"type": "object", "properties": {}},
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "list_today_orders",
     },
     {
         "id": "submit_observation",
@@ -104,7 +306,7 @@ CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "submit_decision",
         "name": "提交投资决策",
-        "description": "记录投资决策并关联观察/论点（摘要与假设请使用中文）",
+        "description": "记录投资决策并关联观察/论点（摘要与假设请使用中文）；可附带工具使用心得 usage_notes",
         "category": "decision",
         "input_schema": {
             "type": "object",
@@ -112,6 +314,27 @@ CAPABILITIES: list[dict[str, Any]] = [
                 "summary": {"type": "string"},
                 "hypothesis": {"type": "string"},
                 "action_plan": {"type": "string"},
+                "usage_notes": {
+                    "type": "array",
+                    "description": "工具使用心得：缺工具/报错/需优化等",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": [
+                                    "missing_tool",
+                                    "tool_error",
+                                    "tool_improve",
+                                    "other",
+                                ],
+                            },
+                            "capability_id": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["kind", "content"],
+                    },
+                },
                 "observation_id": {"type": "integer"},
                 "thesis_id": {"type": "integer"},
                 "agent_run_id": {"type": "integer"},
@@ -163,6 +386,7 @@ CAPABILITIES: list[dict[str, Any]] = [
                 "issue_type": {
                     "type": "string",
                     "enum": [
+                        "NoIssue",
                         "DecisionError",
                         "DataGap",
                         "CapabilityGap",
@@ -174,6 +398,7 @@ CAPABILITIES: list[dict[str, Any]] = [
                 "agent_run_id": {"type": "integer"},
                 "create_change_request": {"type": "boolean"},
                 "change_request": {"type": "object"},
+                "lessons": {"type": "array"},
             },
             "required": ["issue_type", "content"],
         },
@@ -217,6 +442,40 @@ CAPABILITIES: list[dict[str, Any]] = [
         "output_schema": {"type": "object"},
         "permission": "agent",
         "implementation": "list_change_requests",
+    },
+    {
+        "id": "list_experiences",
+        "name": "列出沉淀经验",
+        "description": "读取已沉淀的投资/Agent/系统经验",
+        "category": "review",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "list_experiences",
+    },
+    {
+        "id": "verify_change_request",
+        "name": "验收变更请求",
+        "description": "对已完成开发的 CR 进行测试验收（仅盘后）",
+        "category": "evolution",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "change_request_id": {"type": "integer"},
+                "passed": {"type": "boolean"},
+                "evidence": {"type": "string"},
+            },
+            "required": ["change_request_id", "passed"],
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "verify_change_request",
     },
     {
         "id": "start_agent_run",

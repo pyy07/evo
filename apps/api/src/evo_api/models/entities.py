@@ -28,6 +28,7 @@ class CapabilityStatus(str, enum.Enum):
 
 
 class IssueType(str, enum.Enum):
+    NoIssue = "NoIssue"
     DecisionError = "DecisionError"
     DataGap = "DataGap"
     CapabilityGap = "CapabilityGap"
@@ -36,9 +37,19 @@ class IssueType(str, enum.Enum):
 
 class ChangeRequestStatus(str, enum.Enum):
     proposed = "proposed"
-    approved = "approved"
+    pending_dev = "pending_dev"
     rejected = "rejected"
+    completed = "completed"
+    verified = "verified"
+    # Legacy values kept so old rows can be migrated on startup.
+    approved = "approved"
     implemented = "implemented"
+
+
+class ExperienceKind(str, enum.Enum):
+    investment = "investment"
+    agent = "agent"
+    system = "system"
 
 
 class OrderSide(str, enum.Enum):
@@ -113,6 +124,8 @@ class InvestmentDecision(Base):
     summary: Mapped[str] = mapped_column(Text)
     hypothesis: Mapped[str] = mapped_column(Text, default="")
     action_plan: Mapped[str] = mapped_column(Text, default="")
+    # 盘中工具使用心得：缺工具 / 调用失败 / 需优化等，供盘后复盘汇总经验与 CR
+    usage_notes: Mapped[list[Any]] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -233,6 +246,7 @@ class ChangeRequest(Base):
         Enum(ChangeRequestStatus), default=ChangeRequestStatus.proposed
     )
     review_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    verification_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     implemented_capability_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     capability_payload: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -241,12 +255,26 @@ class ChangeRequest(Base):
     )
 
 
+class Experience(Base):
+    __tablename__ = "experiences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[ExperienceKind] = mapped_column(
+        Enum(ExperienceKind), default=ExperienceKind.investment
+    )
+    content: Mapped[str] = mapped_column(Text)
+    source_review_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    agent_run_id: Mapped[Optional[int]] = mapped_column(ForeignKey("agent_runs.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     actor: Mapped[str] = mapped_column(String(64), default="agent")
     capability_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    agent_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(64))
     request: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     response: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

@@ -19,8 +19,12 @@ uv sync
 # 启动 API（默认 sqlite + mock 行情）
 uv run uvicorn evo_api.main:app --app-dir apps/api/src --reload --port 8000
 
-# 另一终端：Agent 一轮（无 OPENAI_API_KEY 时走规则回退）
-uv run agent-runner once --api-base http://127.0.0.1:8000
+# 另一终端：Agent 常驻（交易日盘中默认每 5 分钟一轮，15:05 后自动盘后复盘）
+uv run agent-runner serve --api-base http://127.0.0.1:8000
+
+# 联调强制单轮（仍受 API 时段硬约束：非盘中不能下单，非盘后不能提 CR）
+uv run agent-runner once --mode intraday --api-base http://127.0.0.1:8000
+uv run agent-runner once --mode postclose --api-base http://127.0.0.1:8000
 
 # Web
 cd apps/web && npm install && npm run dev

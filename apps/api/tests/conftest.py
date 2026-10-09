@@ -17,7 +17,19 @@ os.environ["INSTRUMENTS_CONFIG"] = str(ROOT / "config" / "instruments.yaml")
 from evo_api.db.base import Base  # noqa: E402
 from evo_api.db.session import get_db  # noqa: E402
 from evo_api.main import create_app  # noqa: E402
+from datetime import datetime  # noqa: E402
+
 from evo_api.services.bootstrap import seed_capabilities  # noqa: E402
+from evo_api.services.market_session import CN_TZ  # noqa: E402
+
+OPEN_NOW = datetime(2026, 10, 9, 10, 0, tzinfo=CN_TZ)
+POSTCLOSE_NOW = datetime(2026, 10, 9, 15, 30, tzinfo=CN_TZ)
+WEEKEND_NOW = datetime(2026, 10, 10, 10, 0, tzinfo=CN_TZ)
+
+
+@pytest.fixture(autouse=True)
+def _default_open_session(monkeypatch):
+    monkeypatch.setattr("evo_api.services.market_session.now_cn", lambda: OPEN_NOW)
 
 
 @pytest.fixture()

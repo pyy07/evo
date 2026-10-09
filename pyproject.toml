@@ -28,7 +28,8 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["apps/api/tests", "services/market-data/tests"]
+testpaths = ["apps/api/tests", "services/market-data/tests", "apps/agent-runner/tests"]
+pythonpath = ["apps/api/src", "apps/agent-runner/src", "services/market-data/src"]
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.ruff]
