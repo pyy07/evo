@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 
 from sqlalchemy import (
     JSON,
     Boolean,
+    Date,
     DateTime,
     Enum,
     Float,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -202,6 +204,42 @@ class PortfolioSnapshot(Base):
     equity: Mapped[float] = mapped_column(Float)
     positions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Settlement(Base):
+    """每个交易日一条日终清算记录：日初/日终权益与当日盈亏。"""
+
+    __tablename__ = "settlements"
+    __table_args__ = (UniqueConstraint("trade_date", name="uq_settlements_trade_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    open_equity: Mapped[float] = mapped_column(Float)
+    close_equity: Mapped[float] = mapped_column(Float)
+    open_cash: Mapped[float] = mapped_column(Float)
+    close_cash: Mapped[float] = mapped_column(Float)
+    day_pnl: Mapped[float] = mapped_column(Float)
+    day_pnl_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    total_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    total_pnl_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    buy_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    sell_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    trade_count: Mapped[int] = mapped_column(Integer, default=0)
+    order_count: Mapped[int] = mapped_column(Integer, default=0)
+    decision_count: Mapped[int] = mapped_column(Integer, default=0)
+    positions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    snapshot_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("portfolio_snapshots.id"), nullable=True
+    )
+    agent_run_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_runs.id"), nullable=True
+    )
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Outcome(Base):

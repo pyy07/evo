@@ -66,6 +66,45 @@ def migrate_schema() -> None:
         conn.execute(
             text("UPDATE change_requests SET status = 'completed' WHERE status = 'implemented'")
         )
+        # day_settlements → settlements
+        if dialect == "postgresql":
+            old = conn.execute(
+                text(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name = 'day_settlements'"
+                )
+            ).fetchone()
+            new = conn.execute(
+                text(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name = 'settlements'"
+                )
+            ).fetchone()
+            if old and not new:
+                conn.execute(text("ALTER TABLE day_settlements RENAME TO settlements"))
+                try:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE settlements RENAME CONSTRAINT "
+                            "uq_day_settlements_trade_date TO uq_settlements_trade_date"
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            old = conn.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='day_settlements'"
+                )
+            ).fetchone()
+            new = conn.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='settlements'"
+                )
+            ).fetchone()
+            if old and not new:
+                conn.execute(text("ALTER TABLE day_settlements RENAME TO settlements"))
 
 
 def seed_capabilities(db: Session) -> None:
@@ -94,6 +133,11 @@ def seed_capabilities(db: Session) -> None:
                     status=CapabilityStatus.active,
                 )
             )
+    # 废弃旧能力 id
+    legacy = db.get(Capability, "list_day_settlements")
+    if legacy:
+        legacy.status = CapabilityStatus.disabled
+        legacy.implementation = "list_settlements"
     ensure_account(db)
     seed_experiences(db)
     db.commit()

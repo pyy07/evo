@@ -218,6 +218,125 @@ CAPABILITIES: list[dict[str, Any]] = [
         "implementation": "get_market_breadth",
     },
     {
+        "id": "get_market_news",
+        "name": "市场/个股资讯摘要",
+        "description": (
+            "聚合短资讯供 LLM 阅读：财联社电报、华尔街见闻 A 股快讯，"
+            "可选东财个股新闻。返回截断后的 time/title/summary/source，勿当全文。"
+            "盘中判断情绪/突发时用；个股需传 codes 且 scope=stock|both。"
+        ),
+        "category": "news",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["market", "stock", "both"],
+                    "default": "market",
+                    "description": "market=大盘快讯；stock=个股；both=两者",
+                },
+                "codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "个股/ETF 代码，scope 含 stock 时使用，最多 8 个",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 20,
+                    "description": "最多返回条数（1–50）",
+                },
+                "sources": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["cls", "wscn", "eastmoney"],
+                    },
+                    "description": "数据源子集，默认全部",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "default": 300,
+                    "description": "每条 summary 最大字符数",
+                },
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_market_news",
+    },
+    {
+        "id": "get_announcements",
+        "name": "公司公告摘要",
+        "description": (
+            "巨潮资讯公告标题/类型摘要（无 PDF 正文）。"
+            "持仓或候选标的需核对披露事件时调用；必须传 codes。"
+            "对 A 股效果较好；部分 ETF/基金代码可能无结果，可改用对应股票或 LOF。"
+        ),
+        "category": "news",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "6 位证券代码，最多 8 个",
+                },
+                "days": {
+                    "type": "integer",
+                    "default": 30,
+                    "description": "回溯天数",
+                },
+                "limit": {"type": "integer", "default": 20},
+                "max_chars": {"type": "integer", "default": 200},
+            },
+            "required": ["codes"],
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_announcements",
+    },
+    {
+        "id": "get_macro_digest",
+        "name": "宏观日程与联播摘要",
+        "description": (
+            "华尔街见闻宏观日历（重要性过滤）+ 可选央视新闻联播标题。"
+            "盘后/中长期判断用；calendar 含实际/预期/前值，cctv 仅标题摘要。"
+        ),
+        "category": "news",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days_ahead": {
+                    "type": "integer",
+                    "default": 7,
+                    "description": "未来天数",
+                },
+                "days_back": {
+                    "type": "integer",
+                    "default": 1,
+                    "description": "回溯天数",
+                },
+                "country": {
+                    "type": "string",
+                    "description": "国家过滤，如 中国 / 美国；默认不过滤",
+                },
+                "min_importance": {
+                    "type": "integer",
+                    "default": 2,
+                    "description": "最低重要性 1–4",
+                },
+                "include_cctv": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否附带新闻联播标题",
+                },
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_macro_digest",
+    },
+    {
         "id": "take_portfolio_snapshot",
         "name": "记录组合快照",
         "description": "写入一笔组合估值快照（盘后结算用）",
@@ -230,9 +349,20 @@ CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "settle_day",
         "name": "日终清算",
-        "description": "盘后清算：按最新行情估值、写入快照，汇总当日盈亏/持仓/成交/决策",
+        "description": (
+            "盘后清算：按最新行情估值、写入快照，并 upsert 当日 Settlement"
+            "（日初/日终权益、当日盈亏、买卖成交额等）；每交易日一条。"
+        ),
         "category": "portfolio",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_run_id": {
+                    "type": "integer",
+                    "description": "关联的盘后 AgentRun（可选）",
+                },
+            },
+        },
         "output_schema": {"type": "object"},
         "permission": "agent",
         "implementation": "settle_day",
@@ -240,12 +370,31 @@ CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "get_day_report",
         "name": "获取当日清算日报",
-        "description": "读取当日组合盈亏、持仓、最近快照与精简决策/订单摘要（复盘用）",
+        "description": "读取当日组合盈亏、持仓、最近快照、清算记录与精简决策/订单摘要（复盘用）",
         "category": "portfolio",
         "input_schema": {"type": "object", "properties": {}},
         "output_schema": {"type": "object"},
         "permission": "agent",
         "implementation": "get_day_report",
+    },
+    {
+        "id": "list_settlements",
+        "name": "列出清算记录",
+        "description": "按交易日倒序返回日初/日终权益与当日盈亏等清算记录",
+        "category": "portfolio",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "default": 30,
+                    "description": "最多返回条数（1–365）",
+                },
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "list_settlements",
     },
     {
         "id": "list_today_decisions",

@@ -33,7 +33,7 @@ class ApproveBody(BaseModel):
 
 
 class RejectBody(BaseModel):
-    notes: str = Field(..., min_length=1)
+    notes: str | None = None
 
 
 class ImplementBody(BaseModel):
@@ -110,10 +110,15 @@ def desk(
     db: Session = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Account + today's decisions/orders for the main desk view."""
+    """Account + today's decisions/orders + trades history + settlements."""
     return {
         "portfolio": portfolio_svc.portfolio_view(db),
         "today": portfolio_svc.desk_today(db),
+        "trades_history": portfolio_svc.list_trades(db, limit=200, exclude_today=True)[
+            "items"
+        ],
+        "settlements": portfolio_svc.list_settlements(db, limit=60)["items"],
+        "settlement_today": portfolio_svc.get_settlement(db),
     }
 
 
@@ -178,7 +183,7 @@ def reject_cr(
     ):
         raise HTTPException(400, f"当前状态不可拒绝：{cr.status.value}")
     cr.status = ChangeRequestStatus.rejected
-    cr.review_notes = body.notes.strip()
+    cr.review_notes = (body.notes or "").strip() or None
     db.commit()
     return {"id": cr.id, "status": cr.status.value}
 

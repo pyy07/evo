@@ -59,6 +59,20 @@ def test_mock_market_overview():
     assert flow["inflow"]
 
 
+def test_mock_news_aggregators():
+    p = MarketDataProvider(mode="mock")
+    news = p.get_market_news(scope="both", codes=["510300"], limit=10)
+    assert news["count"] >= 2
+    assert news["items"][0]["title"]
+    anns = p.get_announcements(codes=["510300", "000001"], limit=5)
+    assert anns["count"] >= 1
+    assert anns["items"][0]["code"] in ("510300", "000001")
+    macro = p.get_macro_digest(days_ahead=5, include_cctv=True)
+    assert macro["calendar"]
+    assert macro["cctv"]
+    assert "window" in macro
+
+
 def test_overview_degrades_when_industry_fails():
     p = MarketDataProvider(mode="mock")
 

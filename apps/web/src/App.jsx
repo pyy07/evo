@@ -128,11 +128,104 @@ function InvocationList({ invocations }) {
   );
 }
 
+function TradeTable({ trades, emptyText }) {
+  if (!trades?.length) {
+    return <div className="empty">{emptyText}</div>;
+  }
+  return (
+    <table className="pos-table trade-table">
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>方向</th>
+          <th>代码</th>
+          <th>数量</th>
+          <th>成交价</th>
+          <th>成交额</th>
+          <th>佣金</th>
+          <th>订单</th>
+        </tr>
+      </thead>
+      <tbody>
+        {trades.map((t) => (
+          <tr key={t.id}>
+            <td>{when(t.created_at)}</td>
+            <td className={t.side === "buy" ? "up" : "down"}>
+              {SIDE_LABEL[t.side] || t.side}
+            </td>
+            <td className="sym">{t.symbol}</td>
+            <td>{t.quantity}</td>
+            <td>{money(t.price)}</td>
+            <td>{money(t.amount ?? Number(t.price) * Number(t.quantity))}</td>
+            <td>{money(t.commission)}</td>
+            <td>#{t.order_id}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function SettlementTable({ settlements, todayDate }) {
+  if (!settlements?.length) {
+    return (
+      <div className="empty">
+        还没有清算记录。交易日 15:05 后由盘后 Agent 调用 settle_day 写入（每交易日一条）。
+      </div>
+    );
+  }
+  return (
+    <table className="pos-table settle-table">
+      <thead>
+        <tr>
+          <th>日期</th>
+          <th>日初权益</th>
+          <th>日终权益</th>
+          <th>当日盈亏</th>
+          <th>日初现金</th>
+          <th>日终现金</th>
+          <th>买入额</th>
+          <th>卖出额</th>
+          <th>成交</th>
+          <th>决策</th>
+          <th>浮动盈亏</th>
+        </tr>
+      </thead>
+      <tbody>
+        {settlements.map((s) => (
+          <tr key={s.id} className={s.trade_date === todayDate ? "today-row" : ""}>
+            <td className="sym">{s.trade_date}</td>
+            <td>{money(s.open_equity)}</td>
+            <td>{money(s.close_equity)}</td>
+            <td>
+              <Pnl value={s.day_pnl} withPct={s.day_pnl_pct} />
+            </td>
+            <td>{money(s.open_cash)}</td>
+            <td>{money(s.close_cash)}</td>
+            <td>{money(s.buy_amount)}</td>
+            <td>{money(s.sell_amount)}</td>
+            <td>{s.trade_count}</td>
+            <td>{s.decision_count}</td>
+            <td>
+              <Pnl value={s.unrealized_pnl} />
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 function DeskPage({ desk, busy, onRefresh }) {
   const p = desk?.portfolio;
   const today = desk?.today;
+  const settlements = desk?.settlements || [];
+  const settlementToday = desk?.settlement_today;
+  const tradesToday = today?.trades || [];
+  const tradesHistory = desk?.trades_history || [];
   const openCrHint = desk?.open_cr_count;
   const [expanded, setExpanded] = useState({});
+  const [ledgerTab, setLedgerTab] = useState("today");
 
   const feed = useMemo(() => {
     const decisions = (today?.decisions || []).map((d) => {
@@ -179,7 +272,17 @@ function DeskPage({ desk, busy, onRefresh }) {
     }));
     return [...decisions, ...orders, ...trades].sort((a, b) => String(b.at).localeCompare(String(a.at)));
   }, [today]);
-  const trades = today?.trades || [];
+
+  const ledgerMeta =
+    ledgerTab === "today"
+      ? `${tradesToday.length} 笔 · ${today?.date || ""}`
+      : ledgerTab === "history"
+        ? `${tradesHistory.length} 笔`
+        : `${settlements.length} 条${
+            settlementToday
+              ? ` · 今日已清算（日盈亏 ${money(settlementToday.day_pnl)}）`
+              : " · 今日尚未清算"
+          }`;
 
   return (
     <>
@@ -213,47 +316,6 @@ function DeskPage({ desk, busy, onRefresh }) {
       </section>
 
       <div className="desk-grid">
-        <section className="panel">
-          <h2>
-            持仓
-            <span>
-              {(p?.positions || []).length} 只 · {today?.date || ""}
-            </span>
-          </h2>
-          {(p?.positions || []).length === 0 ? (
-            <div className="empty">暂无持仓，全现金。</div>
-          ) : (
-            <table className="pos-table">
-              <thead>
-                <tr>
-                  <th>代码</th>
-                  <th>数量</th>
-                  <th>可卖</th>
-                  <th>成本</th>
-                  <th>现价</th>
-                  <th>市值</th>
-                  <th>盈亏</th>
-                </tr>
-              </thead>
-              <tbody>
-                {p.positions.map((row) => (
-                  <tr key={row.symbol}>
-                    <td className="sym">{row.symbol}</td>
-                    <td>{row.quantity}</td>
-                    <td>{row.sellable_quantity ?? "—"}</td>
-                    <td>{money(row.avg_cost)}</td>
-                    <td>{money(row.mark_price)}</td>
-                    <td>{money(row.market_value)}</td>
-                    <td>
-                      <Pnl value={row.unrealized_pnl} withPct={row.unrealized_pnl_pct} />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </section>
-
         <section className="panel">
           <h2>
             今日决策 / 订单 / 成交
@@ -314,49 +376,89 @@ function DeskPage({ desk, busy, onRefresh }) {
             <p className="muted tip">有 {openCrHint} 条待处理变更单，可在「演进」页查看。</p>
           ) : null}
         </section>
+
+        <section className="panel">
+          <h2>
+            持仓
+            <span>
+              {(p?.positions || []).length} 只 · {today?.date || ""}
+            </span>
+          </h2>
+          {(p?.positions || []).length === 0 ? (
+            <div className="empty">暂无持仓，全现金。</div>
+          ) : (
+            <table className="pos-table">
+              <thead>
+                <tr>
+                  <th>代码</th>
+                  <th>数量</th>
+                  <th>可卖</th>
+                  <th>成本</th>
+                  <th>现价</th>
+                  <th>市值</th>
+                  <th>盈亏</th>
+                </tr>
+              </thead>
+              <tbody>
+                {p.positions.map((row) => (
+                  <tr key={row.symbol}>
+                    <td className="sym">{row.symbol}</td>
+                    <td>{row.quantity}</td>
+                    <td>{row.sellable_quantity ?? "—"}</td>
+                    <td>{money(row.avg_cost)}</td>
+                    <td>{money(row.mark_price)}</td>
+                    <td>{money(row.market_value)}</td>
+                    <td>
+                      <Pnl value={row.unrealized_pnl} withPct={row.unrealized_pnl_pct} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
       </div>
 
-      <section className="panel trades-panel">
+      <section className="panel ledger-panel">
         <h2>
-          成交明细
+          成交与清算
           <span>
-            {trades.length} 笔 · {today?.date || ""}
+            {ledgerMeta}
+            {" · "}
+            <button type="button" className="linkish" onClick={onRefresh} disabled={busy}>
+              {busy ? "刷新中" : "刷新"}
+            </button>
           </span>
         </h2>
-        {trades.length === 0 ? (
-          <div className="empty">今天还没有成交。</div>
-        ) : (
-          <table className="pos-table trade-table">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>方向</th>
-                <th>代码</th>
-                <th>数量</th>
-                <th>成交价</th>
-                <th>成交额</th>
-                <th>佣金</th>
-                <th>订单</th>
-              </tr>
-            </thead>
-            <tbody>
-              {trades.map((t) => (
-                <tr key={t.id}>
-                  <td>{when(t.created_at)}</td>
-                  <td className={t.side === "buy" ? "up" : "down"}>
-                    {SIDE_LABEL[t.side] || t.side}
-                  </td>
-                  <td className="sym">{t.symbol}</td>
-                  <td>{t.quantity}</td>
-                  <td>{money(t.price)}</td>
-                  <td>{money(t.amount ?? Number(t.price) * Number(t.quantity))}</td>
-                  <td>{money(t.commission)}</td>
-                  <td>#{t.order_id}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+        <div className="tabs" role="tablist">
+          {[
+            { id: "today", label: "当日成交" },
+            { id: "history", label: "历史成交" },
+            { id: "settlements", label: "每日清算" },
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={ledgerTab === tab.id}
+              className={`tab ${ledgerTab === tab.id ? "active" : ""}`}
+              onClick={() => setLedgerTab(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+        <div className="tab-body">
+          {ledgerTab === "today" ? (
+            <TradeTable trades={tradesToday} emptyText="今天还没有成交。" />
+          ) : null}
+          {ledgerTab === "history" ? (
+            <TradeTable trades={tradesHistory} emptyText="暂无历史成交。" />
+          ) : null}
+          {ledgerTab === "settlements" ? (
+            <SettlementTable settlements={settlements} todayDate={today?.date} />
+          ) : null}
+        </div>
       </section>
     </>
   );
@@ -383,8 +485,9 @@ function EvolutionPage({ token, crs, memory, onRefresh }) {
   }
 
   return (
-    <div className="sub-grid">
-      {error ? <div className="flash">{error}</div> : null}
+    <div className="evo-page">
+      {error && !rejectingId ? <div className="flash">{error}</div> : null}
+      <div className="sub-grid">
       <section className="panel">
         <h2>
           变更单
@@ -424,7 +527,14 @@ function EvolutionPage({ token, crs, memory, onRefresh }) {
                   >
                     通过，进入待开发
                   </button>
-                  <button type="button" className="ghost-danger" onClick={() => setRejectingId(cr.id)}>
+                  <button
+                    type="button"
+                    className="ghost-danger"
+                    onClick={() => {
+                      setError("");
+                      setRejectingId(cr.id);
+                    }}
+                  >
                     不做
                   </button>
                 </div>
@@ -447,7 +557,14 @@ function EvolutionPage({ token, crs, memory, onRefresh }) {
                   >
                     开发完成
                   </button>
-                  <button type="button" className="ghost-danger" onClick={() => setRejectingId(cr.id)}>
+                  <button
+                    type="button"
+                    className="ghost-danger"
+                    onClick={() => {
+                      setError("");
+                      setRejectingId(cr.id);
+                    }}
+                  >
                     不做
                   </button>
                 </div>
@@ -456,29 +573,24 @@ function EvolutionPage({ token, crs, memory, onRefresh }) {
               {rejectingId === cr.id ? (
                 <div className="reject-box">
                   <label className="muted" htmlFor={`reject-${cr.id}`}>
-                    填写不做的理由
+                    不做理由（可选）
                   </label>
                   <textarea
                     id={`reject-${cr.id}`}
                     value={rejectReason}
                     onChange={(e) => setRejectReason(e.target.value)}
-                    placeholder="例如：本期优先级不够，先稳住交易闭环。"
+                    placeholder="可选：例如本期优先级不够，先稳住交易闭环。"
                   />
                   <div className="actions">
                     <button
                       type="button"
                       className="primary"
                       onClick={() => {
-                        const notes = rejectReason.trim();
-                        if (!notes) {
-                          setError("不做需要填写理由。");
-                          return;
-                        }
                         run(() =>
                           api(`/admin/change-requests/${cr.id}/reject`, {
                             token,
                             method: "POST",
-                            body: { notes },
+                            body: { notes: rejectReason.trim() || null },
                           }),
                         ).then(() => {
                           setRejectingId(null);
@@ -488,7 +600,13 @@ function EvolutionPage({ token, crs, memory, onRefresh }) {
                     >
                       确认不做
                     </button>
-                    <button type="button" onClick={() => setRejectingId(null)}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRejectingId(null);
+                        setError("");
+                      }}
+                    >
                       取消
                     </button>
                   </div>
@@ -522,6 +640,7 @@ function EvolutionPage({ token, crs, memory, onRefresh }) {
           </ul>
         )}
       </section>
+      </div>
     </div>
   );
 }

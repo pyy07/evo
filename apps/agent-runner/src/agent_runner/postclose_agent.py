@@ -14,6 +14,7 @@ POSTCLOSE_CAPABILITY_TOOLS = frozenset(
         "list_capabilities",
         "get_market_session",
         "get_day_report",
+        "list_settlements",
         "list_today_decisions",
         "list_today_orders",
         "get_portfolio",
@@ -22,6 +23,9 @@ POSTCLOSE_CAPABILITY_TOOLS = frozenset(
         "get_index_valuation",
         "get_market_breadth",
         "get_market_overview",
+        "get_market_news",
+        "get_announcements",
+        "get_macro_digest",
         "list_experiences",
         "list_change_requests",
     }
@@ -136,7 +140,9 @@ def run_postclose_agent_loop(
             "重点阅读 list_today_decisions / get_day_report 中每条决策的 usage_notes"
             "（missing_tool / tool_error / tool_improve），据此沉淀 lessons 或提出 CR。\n"
             "建议工具：get_day_report、list_today_decisions、list_today_orders、"
-            "list_experiences、list_change_requests。\n"
+            "list_experiences、list_change_requests；"
+            "宏观与联播用 get_macro_digest，持仓披露用 get_announcements，"
+            "当日资讯可用 get_market_news。\n"
             "完成后必须调用 finalize_postclose_review；"
             "不要直接调用 submit_review / create_change_request。"
         ),

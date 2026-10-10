@@ -156,12 +156,24 @@ button.linkish {
   text-decoration: underline;
 }
 
+.evo-page {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
 .flash {
   background: #fde8e4;
   border: 1px solid var(--stamp);
   padding: 0.7rem 0.85rem;
   margin-bottom: 1rem;
   font-size: 0.9rem;
+}
+
+.field-error {
+  margin: 0.45rem 0 0;
+  color: var(--danger);
+  font-size: 0.85rem;
 }
 
 .hero-stats {
@@ -319,6 +331,64 @@ button.linkish {
 .feed-item.trade {
   border-left: 3px solid var(--up);
   padding-left: 0.65rem;
+}
+
+.ledger-panel {
+  margin-top: 1.25rem;
+  overflow-x: auto;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.35rem;
+  margin: -0.25rem 0 0.9rem;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 0.55rem;
+}
+
+.tab {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--slate);
+  font-size: 0.88rem;
+  font-weight: 600;
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.tab:hover {
+  color: var(--ink);
+  background: var(--paper-2);
+}
+
+.tab.active {
+  color: var(--ink);
+  border-color: var(--ink);
+  background: #fff;
+}
+
+.tab-body {
+  min-height: 120px;
+}
+
+.settle-table {
+  min-width: 920px;
+}
+
+.settle-table tr.today-row td {
+  background: var(--olive-bg);
+}
+
+.settle-table .pnl.up {
+  color: var(--up);
+  font-weight: 600;
+}
+
+.settle-table .pnl.down {
+  color: var(--down);
+  font-weight: 600;
 }
 
 .trades-panel {

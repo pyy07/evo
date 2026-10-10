@@ -22,6 +22,7 @@ from evo_api.models.entities import (
     Thesis,
 )
 from evo_api.services import portfolio as portfolio_svc
+from evo_api.services import market_session as market_session_svc
 from evo_api.services.market_session import (
     CN_TZ,
     require_review_window,
@@ -309,6 +310,70 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
             {"up": 0, "down": 0, "flat": 0, "total": 0, "histogram": []},
         )
 
+    if impl == "get_market_news":
+        scope = str(payload.get("scope") or "market")
+        codes = payload.get("codes") or []
+        sources = payload.get("sources")
+        return _market_soft(
+            lambda: get_provider().get_market_news(
+                scope=scope,
+                codes=list(codes) if codes else None,
+                limit=int(payload.get("limit") or 20),
+                sources=list(sources) if sources else None,
+                max_chars=int(payload.get("max_chars") or 300),
+            ),
+            {
+                "scope": scope,
+                "count": 0,
+                "items": [],
+                "sources_used": [],
+                "degraded": True,
+                "gaps": ["资讯上游失败，已降级"],
+            },
+        )
+
+    if impl == "get_announcements":
+        codes = list(_require(payload, "codes") or [])
+        if not codes:
+            raise CapabilityError("codes required", status_code=400)
+        return _market_soft(
+            lambda: get_provider().get_announcements(
+                codes=codes,
+                days=int(payload.get("days") or 30),
+                limit=int(payload.get("limit") or 20),
+                max_chars=int(payload.get("max_chars") or 200),
+            ),
+            {
+                "codes": codes,
+                "count": 0,
+                "items": [],
+                "degraded": True,
+                "gaps": ["公告上游失败，已降级"],
+            },
+        )
+
+    if impl == "get_macro_digest":
+        include_cctv = payload.get("include_cctv")
+        if include_cctv is None:
+            include_cctv = True
+        country = payload.get("country")
+        return _market_soft(
+            lambda: get_provider().get_macro_digest(
+                days_ahead=int(payload.get("days_ahead") or 7),
+                days_back=int(payload.get("days_back") or 1),
+                country=str(country) if country else None,
+                min_importance=int(payload.get("min_importance") or 2),
+                include_cctv=bool(include_cctv),
+            ),
+            {
+                "window": {},
+                "calendar": [],
+                "cctv": [],
+                "degraded": True,
+                "gaps": ["宏观摘要上游失败，已降级"],
+            },
+        )
+
     if impl == "get_market_session":
         info = session_snapshot()
         today = datetime.fromisoformat(info["now"]).date()
@@ -332,10 +397,20 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
         }
 
     if impl == "settle_day":
-        return portfolio_svc.settle_day(db)
+        run_id = payload.get("agent_run_id")
+        try:
+            run_id_int = int(run_id) if run_id is not None else None
+        except (TypeError, ValueError):
+            run_id_int = None
+        return portfolio_svc.settle_day(db, agent_run_id=run_id_int)
 
     if impl == "get_day_report":
         return portfolio_svc.day_report(db)
+
+    if impl == "list_settlements":
+        return portfolio_svc.list_settlements(
+            db, limit=int(payload.get("limit") or 30)
+        )
 
     if impl == "list_today_decisions":
         return portfolio_svc.list_today_decisions(db)
@@ -348,6 +423,7 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
             content=_require(payload, "content"),
             data=payload.get("data") or {},
             agent_run_id=payload.get("agent_run_id"),
+            created_at=market_session_svc.now_cn(),
         )
         db.add(obs)
         db.flush()
@@ -358,6 +434,7 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
             content=_require(payload, "content"),
             observation_id=payload.get("observation_id"),
             agent_run_id=payload.get("agent_run_id"),
+            created_at=market_session_svc.now_cn(),
         )
         db.add(th)
         db.flush()
@@ -390,6 +467,7 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
             observation_id=payload.get("observation_id"),
             thesis_id=payload.get("thesis_id"),
             agent_run_id=payload.get("agent_run_id"),
+            created_at=market_session_svc.now_cn(),
         )
         db.add(dec)
         db.flush()
@@ -447,6 +525,7 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
             content=_require(payload, "content"),
             create_change_request=create_cr,
             change_request_id=cr_id,
+            created_at=market_session_svc.now_cn(),
         )
         db.add(review)
         db.flush()
@@ -535,7 +614,11 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
         return {"change_request_id": cr.id, "status": cr.status.value, "passed": passed}
 
     if impl == "start_agent_run":
-        run = AgentRun(trigger=payload.get("trigger") or "manual", notes=payload.get("notes"))
+        run = AgentRun(
+            trigger=payload.get("trigger") or "manual",
+            notes=payload.get("notes"),
+            created_at=market_session_svc.now_cn(),
+        )
         db.add(run)
         db.flush()
         return {"agent_run_id": run.id, "status": run.status}
@@ -546,7 +629,7 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
             raise CapabilityError("找不到对应的 AgentRun", 404)
         run.status = payload.get("status") or "completed"
         run.notes = payload.get("notes") or run.notes
-        run.finished_at = datetime.now(timezone.utc)
+        run.finished_at = market_session_svc.now_cn()
         db.flush()
         return {"agent_run_id": run.id, "status": run.status}
 

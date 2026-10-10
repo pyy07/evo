@@ -23,6 +23,7 @@ INTRADAY_PROMPT = """你是「自演进投资系统」中的投资 Agent：中�
 4. 选股代码来源（按优先级）：
    - list_experiences 中的经验流程（如大盘→行业→ETF）；
    - 看大盘优先 get_market_overview，细分再用 get_industry_ranking / get_board_fund_flow / get_index_valuation / get_market_breadth；
+   - 资讯：get_market_news（快讯）、get_announcements（公告摘要）、get_macro_digest（宏观日历/联播）；
    - get_portfolio 持仓与可卖数量；
    - screen_market / list_universe 返回的候选。
 5. get_market_snapshot / get_etf_history 的 codes 必须来自上面工具结果或持仓；
@@ -43,11 +44,12 @@ POSTCLOSE_PROMPT = """你是「自演进投资系统」中的投资 Agent：中�
 3. 必须汇总当日决策里的 usage_notes（缺工具/调用失败/需优化），据此写 lessons 或 CR；
    无实质问题可不硬凑。
 4. 跟进过往 CR：拒绝理由要读；已完成的可以验收（passed true/false）。
-5. 禁止下单；不要直接调用 submit_review / create_change_request。
-6. issue_type：NoIssue | DecisionError | DataGap | CapabilityGap | ToolUsageError。
-7. CapabilityGap/DataGap 时优先封装 a-stock-data 端点（industry_comparison、board_fund_flow、
-   hsgt_realtime、指数估值等），proposal 写明端点名。
-8. 结束后必须调用 finalize_postclose_review。
+5. 可用 get_macro_digest / get_announcements / get_market_news 补充宏观与披露上下文。
+6. 禁止下单；不要直接调用 submit_review / create_change_request。
+7. issue_type：NoIssue | DecisionError | DataGap | CapabilityGap | ToolUsageError。
+8. CapabilityGap/DataGap 时优先封装 a-stock-data 端点（industry_comparison、board_fund_flow、
+   资讯聚合、指数估值等），proposal 写明端点名。
+9. 结束后必须调用 finalize_postclose_review。
 """
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -299,8 +301,8 @@ def _run_postclose_body(
     capabilities: list[dict[str, Any]],
     run_id: int,
 ) -> dict[str, Any]:
-    # 1) 固定清算：估值 + 快照 + 当日盈亏/持仓/成交汇总
-    settlement = client.invoke("settle_day", {})
+    # 1) 固定清算：估值 + 快照 + 每日清算记录（日初/日终）
+    settlement = client.invoke("settle_day", {"agent_run_id": run_id})
     tool_trace: list[dict[str, Any]] = [{"tool": "settle_day", "phase": "settlement"}]
     decision_payload: dict[str, Any] = {}
 

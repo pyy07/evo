@@ -11,6 +11,7 @@ from evo_api.config import get_settings, load_instruments
 from evo_api.models.entities import (
     AgentRun,
     AuditLog,
+    Settlement,
     Order,
     OrderSide,
     OrderStatus,
@@ -409,21 +410,41 @@ def desk_today(db: Session) -> dict[str, Any]:
             }
             for o in orders
         ],
-        "trades": [
-            {
-                "id": t.id,
-                "order_id": t.order_id,
-                "symbol": t.symbol,
-                "side": t.side.value,
-                "quantity": t.quantity,
-                "price": t.price,
-                "amount": round(float(t.price) * float(t.quantity), 2),
-                "commission": t.commission,
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-            }
-            for t in trades
-        ],
+        "trades": [_trade_item(t) for t in trades],
     }
+
+
+def _trade_item(t: Trade) -> dict[str, Any]:
+    return {
+        "id": t.id,
+        "order_id": t.order_id,
+        "symbol": t.symbol,
+        "side": t.side.value,
+        "quantity": t.quantity,
+        "price": t.price,
+        "amount": round(float(t.price) * float(t.quantity), 2),
+        "commission": t.commission,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "trade_date": (
+            _to_cn_date(t.created_at).isoformat() if _to_cn_date(t.created_at) else None
+        ),
+    }
+
+
+def list_trades(db: Session, *, limit: int = 200, exclude_today: bool = False) -> dict[str, Any]:
+    """成交列表（默认最近 N 笔；exclude_today=True 时仅历史日）。"""
+    limit = max(1, min(int(limit), 500))
+    today = _today_cn()
+    rows = db.query(Trade).order_by(Trade.id.desc()).limit(limit * 3).all()
+    items: list[dict[str, Any]] = []
+    for t in rows:
+        d = _to_cn_date(t.created_at)
+        if exclude_today and d == today:
+            continue
+        items.append(_trade_item(t))
+        if len(items) >= limit:
+            break
+    return {"count": len(items), "items": items}
 
 
 def take_snapshot(db: Session) -> PortfolioSnapshot:
@@ -432,6 +453,7 @@ def take_snapshot(db: Session) -> PortfolioSnapshot:
         cash=view["cash"],
         equity=view["equity"],
         positions={p["symbol"]: p for p in view["positions"]},
+        created_at=market_session_svc.now_cn(),
     )
     db.add(snap)
     db.flush()
@@ -455,18 +477,167 @@ def _slim_decisions(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def settle_day(db: Session) -> dict[str, Any]:
-    """日终清算：按最新行情估值、写入快照，并汇总当日盈亏/持仓/成交。"""
+def _day_trade_amounts(trades: list[dict[str, Any]]) -> tuple[float, float]:
+    buy = 0.0
+    sell = 0.0
+    for t in trades:
+        amount = float(t.get("amount") or (float(t.get("price") or 0) * float(t.get("quantity") or 0)))
+        side = t.get("side")
+        if side == "buy" or side == OrderSide.buy:
+            buy += amount
+        elif side == "sell" or side == OrderSide.sell:
+            sell += amount
+    return round(buy, 2), round(sell, 2)
+
+
+def _open_cash_baseline(db: Session, trade_date: date, fallback_cash: float) -> float:
+    """日初现金：优先前日清算 close_cash，否则前日快照现金。"""
+    prior_settle = (
+        db.query(Settlement)
+        .filter(Settlement.trade_date < trade_date)
+        .order_by(Settlement.trade_date.desc())
+        .first()
+    )
+    if prior_settle is not None:
+        return float(prior_settle.close_cash)
+    snaps = (
+        db.query(PortfolioSnapshot)
+        .order_by(PortfolioSnapshot.created_at.desc())
+        .limit(500)
+        .all()
+    )
+    for s in snaps:
+        d = _to_cn_date(s.created_at)
+        if d and d < trade_date:
+            return float(s.cash)
+    return float(fallback_cash)
+
+
+def _settlement_dict(row: Settlement) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "trade_date": row.trade_date.isoformat(),
+        "open_equity": row.open_equity,
+        "close_equity": row.close_equity,
+        "open_cash": row.open_cash,
+        "close_cash": row.close_cash,
+        "day_pnl": row.day_pnl,
+        "day_pnl_pct": row.day_pnl_pct,
+        "total_pnl": row.total_pnl,
+        "total_pnl_pct": row.total_pnl_pct,
+        "unrealized_pnl": row.unrealized_pnl,
+        "buy_amount": row.buy_amount,
+        "sell_amount": row.sell_amount,
+        "trade_count": row.trade_count,
+        "order_count": row.order_count,
+        "decision_count": row.decision_count,
+        "positions": row.positions or {},
+        "snapshot_id": row.snapshot_id,
+        "agent_run_id": row.agent_run_id,
+        "notes": row.notes or "",
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def upsert_settlement(
+    db: Session,
+    *,
+    view: dict[str, Any],
+    snap: PortfolioSnapshot,
+    today: dict[str, Any],
+    agent_run_id: int | None = None,
+    notes: str = "",
+) -> Settlement:
+    """写入或更新当日清算记录（每交易日一条）。"""
+    trade_date = date.fromisoformat(str(today["date"]))
+    open_equity = float(view["day_start_equity"])
+    close_equity = float(view["equity"])
+    open_cash = _open_cash_baseline(db, trade_date, float(view["cash"]))
+    close_cash = float(view["cash"])
+    buy_amount, sell_amount = _day_trade_amounts(today.get("trades") or [])
+    positions = {p["symbol"]: p for p in (view.get("positions") or [])}
+
+    row = (
+        db.query(Settlement)
+        .filter(Settlement.trade_date == trade_date)
+        .one_or_none()
+    )
+    if row is None:
+        row = Settlement(trade_date=trade_date)
+        db.add(row)
+
+    row.open_equity = open_equity
+    row.close_equity = close_equity
+    row.open_cash = open_cash
+    row.close_cash = close_cash
+    row.day_pnl = float(view["day_pnl"])
+    row.day_pnl_pct = float(view["day_pnl_pct"])
+    row.total_pnl = float(view["total_pnl"])
+    row.total_pnl_pct = float(view["total_pnl_pct"])
+    row.unrealized_pnl = float(view["unrealized_pnl"])
+    row.buy_amount = buy_amount
+    row.sell_amount = sell_amount
+    row.trade_count = int(today.get("trade_count") or len(today.get("trades") or []))
+    row.order_count = int(today.get("order_count") or len(today.get("orders") or []))
+    row.decision_count = int(
+        today.get("decision_count") or len(today.get("decisions") or [])
+    )
+    row.positions = positions
+    row.snapshot_id = snap.id
+    if agent_run_id is not None:
+        row.agent_run_id = agent_run_id
+    if notes:
+        row.notes = notes
+    db.flush()
+    return row
+
+
+def list_settlements(db: Session, *, limit: int = 30) -> dict[str, Any]:
+    limit = max(1, min(int(limit), 365))
+    rows = (
+        db.query(Settlement)
+        .order_by(Settlement.trade_date.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "count": len(rows),
+        "items": [_settlement_dict(r) for r in rows],
+    }
+
+
+def get_settlement(db: Session, trade_date: date | None = None) -> dict[str, Any] | None:
+    day = trade_date or _today_cn()
+    row = db.query(Settlement).filter(Settlement.trade_date == day).one_or_none()
+    return _settlement_dict(row) if row else None
+
+
+def settle_day(db: Session, *, agent_run_id: int | None = None) -> dict[str, Any]:
+    """日终清算：按最新行情估值、写入快照与每日清算记录，并汇总当日盈亏/持仓/成交。"""
     from evo_api.services.market_session import require_review_window
 
     require_review_window()
     view = portfolio_view(db)
     snap = take_snapshot(db)
     today = desk_today(db)
+    settlement = upsert_settlement(
+        db,
+        view=view,
+        snap=snap,
+        today=today,
+        agent_run_id=agent_run_id,
+        notes="日终清算",
+    )
     return {
         "settled": True,
         "date": today["date"],
+        "settlement_id": settlement.id,
         "snapshot_id": snap.id,
+        "open_equity": settlement.open_equity,
+        "close_equity": settlement.close_equity,
+        "open_cash": settlement.open_cash,
+        "close_cash": settlement.close_cash,
         "cash": view["cash"],
         "equity": view["equity"],
         "day_start_equity": view["day_start_equity"],
@@ -475,6 +646,8 @@ def settle_day(db: Session) -> dict[str, Any]:
         "total_pnl": view["total_pnl"],
         "total_pnl_pct": view["total_pnl_pct"],
         "unrealized_pnl": view["unrealized_pnl"],
+        "buy_amount": settlement.buy_amount,
+        "sell_amount": settlement.sell_amount,
         "positions": view["positions"],
         "orders_today": today["orders"],
         "trades_today": today["trades"],
@@ -482,11 +655,12 @@ def settle_day(db: Session) -> dict[str, Any]:
         "decision_count": len(today["decisions"]),
         "order_count": len(today["orders"]),
         "trade_count": len(today["trades"]),
+        "settlement": _settlement_dict(settlement),
     }
 
 
 def day_report(db: Session) -> dict[str, Any]:
-    """读取当日清算视角报告（不强制新快照；附最近快照若存在）。"""
+    """读取当日清算视角报告（不强制新快照；附最近快照与清算记录若存在）。"""
     view = portfolio_view(db)
     today = desk_today(db)
     snaps = (
@@ -506,6 +680,7 @@ def day_report(db: Session) -> dict[str, Any]:
                 "created_at": s.created_at.isoformat() if s.created_at else None,
             }
             break
+    settlement = get_settlement(db)
     return {
         "date": today["date"],
         "portfolio": {
@@ -519,6 +694,7 @@ def day_report(db: Session) -> dict[str, Any]:
             "positions": view["positions"],
         },
         "latest_snapshot_today": latest_today,
+        "settlement": settlement,
         "decision_count": len(today["decisions"]),
         "order_count": len(today["orders"]),
         "trade_count": len(today["trades"]),
@@ -593,6 +769,7 @@ def submit_order(
     min_commission = float(rules.get("min_commission", 0.0))
     commission = max(notional * commission_rate, min_commission)
 
+    now = market_session_svc.now_cn()
     order = Order(
         decision_id=decision_id,
         agent_run_id=agent_run_id,
@@ -600,6 +777,7 @@ def submit_order(
         side=OrderSide(side),
         quantity=quantity,
         status=OrderStatus.filled,
+        created_at=now,
     )
 
     if side == "buy":
@@ -638,6 +816,7 @@ def submit_order(
         quantity=quantity,
         price=price,
         commission=commission,
+        created_at=now,
     )
     db.add(trade)
     snap = take_snapshot(db)

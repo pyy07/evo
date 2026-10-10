@@ -103,6 +103,32 @@ def test_market_overview_capability(client):
     assert flow.status_code == 200
 
 
+def test_news_capabilities(client):
+    news = _invoke(
+        client,
+        "get_market_news",
+        {"scope": "both", "codes": ["510300"], "limit": 8},
+    )
+    assert news.status_code == 200
+    nbody = news.json()["result"]
+    assert nbody["count"] >= 1
+    assert nbody["items"][0]["summary"]
+    anns = _invoke(client, "get_announcements", {"codes": ["510300"], "days": 30})
+    assert anns.status_code == 200
+    assert anns.json()["result"]["items"]
+    missing = _invoke(client, "get_announcements", {})
+    assert missing.status_code == 400
+    macro = _invoke(
+        client,
+        "get_macro_digest",
+        {"days_ahead": 5, "min_importance": 2, "include_cctv": True},
+    )
+    assert macro.status_code == 200
+    mbody = macro.json()["result"]
+    assert mbody["calendar"]
+    assert mbody["cctv"]
+
+
 def test_screen_etf_and_convertible_bond(client):
     etf = _invoke(client, "screen_market", {"stock_type": "etf", "top_n": 8})
     assert etf.status_code == 200
@@ -293,15 +319,43 @@ def test_settle_day_and_day_report(client, monkeypatch):
     assert "day_pnl" in body
     assert "positions" in body
     assert body["snapshot_id"]
+    assert body["settlement_id"]
+    assert body["settlement"]["trade_date"]
+    assert body["open_equity"] == body["settlement"]["open_equity"]
+    assert body["close_equity"] == body["settlement"]["close_equity"]
     report = _invoke(client, "get_day_report")
     assert report.status_code == 200
     rbody = report.json()["result"]
     assert rbody["latest_snapshot_today"]["snapshot_id"] == body["snapshot_id"]
+    assert rbody["settlement"]["id"] == body["settlement_id"]
+    listed = _invoke(client, "list_settlements", {"limit": 10})
+    assert listed.status_code == 200
+    items = listed.json()["result"]["items"]
+    assert items
+    assert items[0]["id"] == body["settlement_id"]
+    # 同日再清算应 upsert，仍只有一条
+    again = _invoke(client, "settle_day")
+    assert again.status_code == 200
+    assert again.json()["result"]["settlement_id"] == body["settlement_id"]
+    listed2 = _invoke(client, "list_settlements", {"limit": 10})
+    assert listed2.json()["result"]["count"] == 1
     decisions = _invoke(client, "list_today_decisions")
     assert decisions.status_code == 200
     orders = _invoke(client, "list_today_orders")
     assert orders.status_code == 200
     assert orders.json()["result"]["order_count"] >= 1
+
+
+def test_admin_desk_includes_settlements(client, monkeypatch):
+    monkeypatch.setattr("evo_api.services.market_session.now_cn", lambda: POSTCLOSE_NOW)
+    _invoke(client, "settle_day")
+    desk = client.get("/admin/desk", headers={"Authorization": "Bearer test-admin"})
+    assert desk.status_code == 200
+    body = desk.json()
+    assert body["settlements"]
+    assert body["settlement_today"] is not None
+    assert body["settlement_today"]["close_equity"] is not None
+    assert "trades_history" in body
 
 
 def test_empty_postclose_review_without_cr_or_lessons(client, monkeypatch):
@@ -316,7 +370,7 @@ def test_empty_postclose_review_without_cr_or_lessons(client, monkeypatch):
     assert r.json()["result"]["experience_ids"] == []
 
 
-def test_reject_requires_reason_and_verify_failed_returns_pending(client, monkeypatch):
+def test_reject_allows_empty_reason_and_verify_failed_returns_pending(client, monkeypatch):
     monkeypatch.setattr("evo_api.services.market_session.now_cn", lambda: POSTCLOSE_NOW)
     created = _invoke(
         client,
@@ -330,15 +384,9 @@ def test_reject_requires_reason_and_verify_failed_returns_pending(client, monkey
     assert created.status_code == 200
     cr_id = created.json()["result"]["change_request_id"]
     headers = {"Authorization": "Bearer test-admin"}
-    bad = client.post(
-        f"/admin/change-requests/{cr_id}/reject",
-        json={"notes": ""},
-        headers=headers,
-    )
-    assert bad.status_code == 422
     ok = client.post(
         f"/admin/change-requests/{cr_id}/reject",
-        json={"notes": "本期不做，优先稳定交易闭环"},
+        json={"notes": ""},
         headers=headers,
     )
     assert ok.status_code == 200
@@ -463,7 +511,11 @@ def test_desk_and_portfolio_pnl(client):
     assert "unrealized_pnl" in port["positions"][0]
     assert isinstance(body["today"]["orders"], list)
     assert isinstance(body["today"]["trades"], list)
+    assert isinstance(body["trades_history"], list)
     assert len(body["today"]["trades"]) >= 1
+    # 当日成交不应出现在历史成交里
+    today_ids = {t["id"] for t in body["today"]["trades"]}
+    assert today_ids.isdisjoint({t["id"] for t in body["trades_history"]})
     trade = body["today"]["trades"][0]
     assert trade["symbol"] == "510300"
     assert trade["quantity"] == 100

@@ -1194,6 +1194,323 @@ class MarketDataProvider:
             )
         return rows[-count:]
 
+    def get_market_news(
+        self,
+        *,
+        scope: str = "market",
+        codes: list[str] | None = None,
+        limit: int = 20,
+        sources: list[str] | None = None,
+        max_chars: int = 300,
+    ) -> dict[str, Any]:
+        """聚合盘中资讯：财联社电报 + 华尔街见闻快讯 + 可选东财个股新闻。"""
+        limit = max(1, min(int(limit), 50))
+        max_chars = max(80, min(int(max_chars), 800))
+        scope = (scope or "market").lower()
+        if scope not in ("market", "stock", "both"):
+            scope = "market"
+        wanted = {s.lower() for s in (sources or ["cls", "wscn", "eastmoney"])}
+        codes = [c for c in (codes or []) if c]
+        if self.mode == "mock":
+            items = self._mock_market_news(scope=scope, codes=codes, limit=limit)
+            return {
+                "scope": scope,
+                "count": len(items),
+                "items": items,
+                "sources_used": sorted(wanted),
+                "source": "mock",
+            }
+
+        from market_data import news as news_mod
+
+        items: list[dict[str, Any]] = []
+        degraded: list[dict[str, str]] = []
+        sources_used: list[str] = []
+
+        if scope in ("market", "both"):
+            if "cls" in wanted:
+                try:
+                    rows = news_mod.fetch_cls_telegraph(
+                        limit=min(limit, 40), max_chars=max_chars
+                    )
+                    items.extend(rows)
+                    sources_used.append("cls")
+                except Exception as exc:  # noqa: BLE001
+                    degraded.append({"section": "cls", "error": str(exc)[:300]})
+            if "wscn" in wanted:
+                try:
+                    rows = news_mod.fetch_wscn_lives(
+                        channel="a-stock-channel",
+                        limit=min(limit, 40),
+                        max_chars=max_chars,
+                    )
+                    items.extend(rows)
+                    sources_used.append("wscn")
+                except Exception as exc:  # noqa: BLE001
+                    degraded.append({"section": "wscn", "error": str(exc)[:300]})
+
+        if scope in ("stock", "both") and codes:
+            if "eastmoney" in wanted:
+                per = max(3, min(10, limit // max(len(codes), 1)))
+                for code in codes[:8]:
+                    try:
+                        rows = news_mod.fetch_eastmoney_stock_news(
+                            code, limit=per, max_chars=max_chars
+                        )
+                        items.extend(rows)
+                        if "eastmoney" not in sources_used:
+                            sources_used.append("eastmoney")
+                    except Exception as exc:  # noqa: BLE001
+                        degraded.append(
+                            {"section": f"eastmoney:{code}", "error": str(exc)[:300]}
+                        )
+
+        # 按时间倒序去重（title+source）
+        seen: set[str] = set()
+        uniq: list[dict[str, Any]] = []
+        for it in sorted(items, key=lambda r: r.get("time") or "", reverse=True):
+            key = f"{it.get('source')}|{it.get('title')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(it)
+            if len(uniq) >= limit:
+                break
+
+        if not uniq and degraded:
+            raise MarketDataError("market news empty: " + str(degraded))
+        return {
+            "scope": scope,
+            "count": len(uniq),
+            "items": uniq,
+            "sources_used": sources_used,
+            "degraded": degraded,
+            "source": "cls+wscn+eastmoney",
+        }
+
+    def get_announcements(
+        self,
+        *,
+        codes: list[str] | None = None,
+        days: int = 30,
+        limit: int = 20,
+        max_chars: int = 200,
+    ) -> dict[str, Any]:
+        """巨潮资讯公告摘要（按代码聚合，截断标题/类型）。"""
+        codes = ["".join(ch for ch in str(c) if ch.isdigit())[-6:] for c in (codes or [])]
+        codes = [c for c in codes if len(c) == 6][:8]
+        if not codes:
+            raise MarketDataError("get_announcements 需要至少一个 6 位代码")
+        limit = max(1, min(int(limit), 50))
+        days = max(1, min(int(days), 180))
+        max_chars = max(60, min(int(max_chars), 400))
+        if self.mode == "mock":
+            items = self._mock_announcements(codes=codes, limit=limit)
+            return {
+                "codes": codes,
+                "days": days,
+                "count": len(items),
+                "items": items,
+                "source": "mock",
+            }
+
+        from market_data import news as news_mod
+
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        items: list[dict[str, Any]] = []
+        degraded: list[dict[str, str]] = []
+        per = max(5, min(20, limit // max(len(codes), 1) + 3))
+        for code in codes:
+            try:
+                rows = news_mod.fetch_cninfo_announcements(
+                    code, limit=per, max_chars=max_chars
+                )
+                items.extend(r for r in rows if (r.get("date") or "") >= cutoff)
+            except Exception as exc:  # noqa: BLE001
+                degraded.append({"section": f"cninfo:{code}", "error": str(exc)[:300]})
+
+        items = sorted(items, key=lambda r: r.get("date") or "", reverse=True)[:limit]
+        if not items and degraded:
+            raise MarketDataError("announcements empty: " + str(degraded))
+        return {
+            "codes": codes,
+            "days": days,
+            "count": len(items),
+            "items": items,
+            "degraded": degraded,
+            "source": "cninfo",
+        }
+
+    def get_macro_digest(
+        self,
+        *,
+        days_ahead: int = 7,
+        days_back: int = 1,
+        country: str | None = None,
+        min_importance: int = 2,
+        include_cctv: bool = True,
+        max_chars: int = 300,
+    ) -> dict[str, Any]:
+        """宏观日历（华尔街见闻）+ 可选新闻联播标题，供盘后/中长期判断。"""
+        days_ahead = max(0, min(int(days_ahead), 30))
+        days_back = max(0, min(int(days_back), 14))
+        min_importance = max(1, min(int(min_importance), 4))
+        max_chars = max(80, min(int(max_chars), 600))
+        today = date.today()
+        start = today - timedelta(days=days_back)
+        end = today + timedelta(days=days_ahead)
+        if self.mode == "mock":
+            return {
+                "window": {"start": start.isoformat(), "end": end.isoformat()},
+                "calendar": self._mock_macro_calendar(start, end, min_importance),
+                "cctv": self._mock_cctv(today - timedelta(days=1)) if include_cctv else [],
+                "source": "mock",
+            }
+
+        from market_data import news as news_mod
+
+        degraded: list[dict[str, str]] = []
+        calendar: list[dict[str, Any]] = []
+        try:
+            calendar = news_mod.fetch_macro_calendar(
+                start,
+                end,
+                country=country,
+                min_importance=min_importance,
+            )
+        except Exception as exc:  # noqa: BLE001
+            degraded.append({"section": "macro_calendar", "error": str(exc)[:300]})
+
+        cctv: list[dict[str, Any]] = []
+        if include_cctv:
+            # 优先昨日联播；若空再试前日
+            for offset in (1, 2, 0):
+                day = today - timedelta(days=offset)
+                try:
+                    cctv = news_mod.fetch_cctv_news(
+                        day, with_content=False, max_chars=max_chars
+                    )
+                    if cctv:
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    degraded.append(
+                        {"section": f"cctv:{day.isoformat()}", "error": str(exc)[:300]}
+                    )
+
+        if not calendar and not cctv and degraded:
+            raise MarketDataError("macro digest empty: " + str(degraded))
+        return {
+            "window": {"start": start.isoformat(), "end": end.isoformat()},
+            "calendar": calendar,
+            "cctv": cctv,
+            "degraded": degraded,
+            "source": "wscn_macro+cctv",
+        }
+
+    def _mock_market_news(
+        self, *, scope: str, codes: list[str], limit: int
+    ) -> list[dict[str, Any]]:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        items: list[dict[str, Any]] = []
+        if scope in ("market", "both"):
+            items.extend(
+                [
+                    {
+                        "time": now,
+                        "title": "两市成交额回升，科技板块领涨",
+                        "summary": "模拟快讯：沪指震荡上行，半导体与软件走强。",
+                        "source": "财联社",
+                        "url": "",
+                    },
+                    {
+                        "time": now,
+                        "title": "北向资金午后净流入扩大",
+                        "summary": "模拟快讯：外资回流宽基 ETF。",
+                        "source": "华尔街见闻",
+                        "url": "",
+                    },
+                ]
+            )
+        if scope in ("stock", "both"):
+            for code in (codes or ["510300"])[:3]:
+                items.append(
+                    {
+                        "time": now,
+                        "title": f"{code} 相关机构点评",
+                        "summary": f"模拟个股新闻：关注 {code} 流动性与溢价。",
+                        "source": "东财",
+                        "url": "",
+                        "code": code,
+                    }
+                )
+        return items[:limit]
+
+    def _mock_announcements(
+        self, *, codes: list[str], limit: int
+    ) -> list[dict[str, Any]]:
+        today = date.today().isoformat()
+        items: list[dict[str, Any]] = []
+        for code in codes:
+            items.append(
+                {
+                    "date": today,
+                    "title": f"{code} 关于基金份额折算的公告",
+                    "type": "其他",
+                    "summary": f"其他 {code} 关于基金份额折算的公告",
+                    "source": "巨潮",
+                    "url": "",
+                    "code": code,
+                }
+            )
+        return items[:limit]
+
+    def _mock_macro_calendar(
+        self, start: date, end: date, min_importance: int
+    ) -> list[dict[str, Any]]:
+        mid = start + timedelta(days=min(2, (end - start).days))
+        return [
+            {
+                "time": f"{mid.isoformat()} 09:30",
+                "country": "中国",
+                "title": "制造业 PMI",
+                "kind": "data",
+                "importance": max(min_importance, 3),
+                "actual": None,
+                "forecast": "50.2",
+                "previous": "50.0",
+                "unit": "",
+            },
+            {
+                "time": f"{(mid + timedelta(days=1)).isoformat()} 21:30",
+                "country": "美国",
+                "title": "非农就业人数",
+                "kind": "data",
+                "importance": 4,
+                "actual": None,
+                "forecast": "18万",
+                "previous": "15万",
+                "unit": "",
+            },
+        ]
+
+    def _mock_cctv(self, day: date) -> list[dict[str, Any]]:
+        return [
+            {
+                "date": day.isoformat(),
+                "title": "中央政治局召开会议研究经济工作",
+                "summary": "中央政治局召开会议研究经济工作",
+                "source": "新闻联播",
+                "url": "",
+            },
+            {
+                "date": day.isoformat(),
+                "title": "多部门部署稳外贸稳外资措施",
+                "summary": "多部门部署稳外贸稳外资措施",
+                "source": "新闻联播",
+                "url": "",
+            },
+        ]
+
     def _mock_calendar(self, year: int, month: int) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         d = date(year, month, 1)
