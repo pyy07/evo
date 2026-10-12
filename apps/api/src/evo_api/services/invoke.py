@@ -310,6 +310,12 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
             {"up": 0, "down": 0, "flat": 0, "total": 0, "histogram": []},
         )
 
+    if impl == "get_hsgt_flow":
+        return _market_soft(
+            lambda: get_provider().get_hsgt_flow(),
+            {"northbound": {}, "southbound": {}, "unit": "万元"},
+        )
+
     if impl == "get_market_news":
         scope = str(payload.get("scope") or "market")
         codes = payload.get("codes") or []

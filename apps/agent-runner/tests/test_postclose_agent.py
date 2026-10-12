@@ -11,6 +11,9 @@ def test_postclose_tools_include_settlement_readers():
         {"id": "get_day_report", "description": "日报", "input_schema": {"type": "object", "properties": {}}},
         {"id": "list_today_decisions", "description": "决策", "input_schema": {"type": "object", "properties": {}}},
         {"id": "list_today_orders", "description": "订单", "input_schema": {"type": "object", "properties": {}}},
+        {"id": "get_board_fund_flow", "description": "资金流", "input_schema": {"type": "object", "properties": {}}},
+        {"id": "get_industry_ranking", "description": "行业", "input_schema": {"type": "object", "properties": {}}},
+        {"id": "get_hsgt_flow", "description": "北向", "input_schema": {"type": "object", "properties": {}}},
         {"id": "submit_review", "description": "不应出现", "input_schema": {"type": "object", "properties": {}}},
         {"id": "settle_day", "description": "清算由 runner 先做", "input_schema": {"type": "object", "properties": {}}},
     ]
@@ -19,6 +22,9 @@ def test_postclose_tools_include_settlement_readers():
     assert "get_day_report" in names
     assert "list_today_decisions" in names
     assert "list_today_orders" in names
+    assert "get_board_fund_flow" in names
+    assert "get_industry_ranking" in names
+    assert "get_hsgt_flow" in names
     assert "submit_review" not in names
     assert "settle_day" not in names  # runner 强制清算，不给模型重复清算
     assert names[-1] == FINALIZE_TOOL_NAME

@@ -18,6 +18,7 @@ INTRADAY_CAPABILITY_TOOLS = frozenset(
         "get_board_fund_flow",
         "get_index_valuation",
         "get_market_breadth",
+        "get_hsgt_flow",
         "get_market_news",
         "get_announcements",
         "get_macro_digest",
@@ -125,11 +126,13 @@ def run_intraday_agent_loop(
         user_message=(
             f"本轮盘中决策。资产类型={stock_type}。\n"
             "请先 list_experiences 与 get_portfolio；看大盘优先 get_market_overview"
-            "（指数+估值+行业/概念+资金流+涨跌分布）。"
+            "（指数+估值+北向+行业/概念+资金流+涨跌分布）。"
             "突发/情绪可用 get_market_news（大盘快讯；持仓或候选可 scope=stock/both+codes）；"
             "核对披露用 get_announcements；宏观日程用 get_macro_digest（盘中可选）。"
-            "估值用 get_index_valuation（勿用 ETF 快照 pe_ttm=0），"
-            "K 线用 get_etf_history 取最近 10–20 根，看返回的 latest。\n"
+            "估值用 get_index_valuation（勿用 ETF 快照 pe_ttm=0；"
+            "pb_status=unavailable / pe_percentile 仅为近期窗口时勿当成全历史）。"
+            "风格落地可用 list_universe/screen_market 中的上证50/红利类 ETF；"
+            "北向验证用 get_hsgt_flow。K 线取最近 10–20 根并看 latest。\n"
             "再按经验决定是否 screen_market/list_universe，以及对哪些代码拉快照/K线。\n"
             "个股/ETF 报价代码只能来自工具返回或持仓，不要使用固定主题 ETF 清单。\n"
             "finalize 时务必填写 usage_notes（缺工具/调用失败/需优化等；没有就 []），"

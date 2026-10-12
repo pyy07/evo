@@ -125,9 +125,9 @@ CAPABILITIES: list[dict[str, Any]] = [
         "id": "get_market_overview",
         "name": "大盘综合信息",
         "description": (
-            "盘中大盘综合快照：主要指数、沪深300估值、行业/概念涨跌、行业资金流向、"
-            "全市场涨跌分布。行业等分项失败会降级保留其余字段，不会整包 502。"
-            "看大盘时应优先调用本能力。"
+            "盘中大盘综合快照：主要指数、沪深300估值、北向资金、行业/概念涨跌、"
+            "行业资金流向、全市场涨跌分布。分项失败会降级保留其余字段。"
+            "概念榜已过滤涨停/打板等统计标签；资金流为压缩字段，完整分项请调 get_board_fund_flow。"
         ),
         "category": "market",
         "input_schema": {
@@ -189,8 +189,9 @@ CAPABILITIES: list[dict[str, Any]] = [
         "id": "get_index_valuation",
         "name": "指数/ETF估值",
         "description": (
-            "指数或宽基 ETF 的 PE/PB/PE分位。ETF 快照 pe_ttm/pb 常为 0，"
-            "请把 510300 等映射到 000300 后调用本能力，不要用个股字段当指数估值。"
+            "指数或宽基 ETF 估值：优先中证 PE/股息率与近期窗口 PE 分位；"
+            "ETF 快照 pe_ttm/pb 常为 0 或 '-'，510300 会映射到 000300。"
+            "中证文件不含 PB，pb 可能为 null；pe_percentile 非全历史分位。"
         ),
         "category": "market",
         "input_schema": {
@@ -216,6 +217,19 @@ CAPABILITIES: list[dict[str, Any]] = [
         "output_schema": {"type": "object"},
         "permission": "agent",
         "implementation": "get_market_breadth",
+    },
+    {
+        "id": "get_hsgt_flow",
+        "name": "北向/沪深港通资金",
+        "description": (
+            "沪深港通额度与净流入（东财 kamt）。返回 northbound/southbound 的日净流入（万元）。"
+            "用于验证外资集中度与风格切换，不替代行业资金流。"
+        ),
+        "category": "market",
+        "input_schema": {"type": "object", "properties": {}},
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_hsgt_flow",
     },
     {
         "id": "get_market_news",

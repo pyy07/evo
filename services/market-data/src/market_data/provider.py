@@ -30,6 +30,38 @@ def _compact_bar(row: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in out.items() if v is not None}
 
 
+def _is_concept_noise(row: dict[str, Any]) -> bool:
+    code = str(row.get("code") or "").upper()
+    name = str(row.get("name") or "")
+    if code in _CONCEPT_NOISE_CODES:
+        return True
+    return any(key in name for key in _CONCEPT_NOISE_NAME_KEYS)
+
+
+def _compact_board_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """概览里只保留必要字段，避免 tool 输出被 6k 截断后丢掉资金流尾部。"""
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        item = {
+            "rank": row.get("rank"),
+            "code": row.get("code"),
+            "name": row.get("name"),
+            "change_pct": row.get("change_pct"),
+        }
+        if row.get("main_net") is not None:
+            item["main_net"] = row.get("main_net")
+        if row.get("main_pct") is not None:
+            item["main_pct"] = row.get("main_pct")
+        if row.get("leader"):
+            item["leader"] = row.get("leader")
+        if row.get("up_count") is not None:
+            item["up_count"] = row.get("up_count")
+        if row.get("down_count") is not None:
+            item["down_count"] = row.get("down_count")
+        out.append(item)
+    return out
+
+
 def _parse_zd_fenbu(fenbu: Any) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     if isinstance(fenbu, dict):
@@ -112,10 +144,16 @@ _MOCK_STOCK_UNIVERSE: list[dict[str, str]] = [
 
 _MOCK_ETF_UNIVERSE: list[dict[str, str]] = [
     {"code": "510300", "name": "沪深300ETF"},
+    {"code": "510050", "name": "上证50ETF"},
     {"code": "510500", "name": "中证500ETF"},
     {"code": "159915", "name": "创业板ETF"},
     {"code": "588000", "name": "科创50ETF"},
     {"code": "512100", "name": "1000ETF"},
+    {"code": "512890", "name": "红利低波ETF"},
+    {"code": "563020", "name": "中证红利ETF"},
+    {"code": "515080", "name": "中证红利ETF"},
+    {"code": "510880", "name": "红利ETF"},
+    {"code": "159905", "name": "深红利ETF"},
     {"code": "513100", "name": "纳指ETF"},
     {"code": "513500", "name": "标普500ETF"},
     {"code": "511010", "name": "国债ETF"},
@@ -133,6 +171,23 @@ _MOCK_ETF_UNIVERSE: list[dict[str, str]] = [
     {"code": "511880", "name": "银华日利"},
 ]
 
+# 概念榜里的交易统计型板块（非主题），干扰风格/主题判断
+_CONCEPT_NOISE_CODES = frozenset({"BK1645", "BK1675", "BK1050", "BK0815", "BK0816"})
+_CONCEPT_NOISE_NAME_KEYS = (
+    "打板",
+    "打二板",
+    "涨停",
+    "跌停",
+    "连板",
+    "炸板",
+    "新高",
+    "新低",
+    "一字",
+    "昨日",
+    "晋级",
+    "破板",
+)
+
 # 常见宽基 ETF → 中证/国证指数（估值）
 _ETF_TO_INDEX = {
     "510300": "000300",
@@ -144,6 +199,11 @@ _ETF_TO_INDEX = {
     "588000": "000688",
     "588080": "000688",
     "512100": "000852",
+    "512890": "930955",  # 中证红利低波近似映射；无中证文件时仅作代码锚
+    "563020": "000922",
+    "515080": "000922",
+    "510880": "000015",
+    "159905": "399324",
 }
 
 _MOCK_CB_UNIVERSE: list[dict[str, str]] = [
@@ -821,8 +881,24 @@ class MarketDataProvider:
         diff = ((payload or {}).get("data") or {}).get("diff") or []
         return [row for row in diff if isinstance(row, dict)]
 
+    @staticmethod
+    def _num_or_none(value: Any) -> float | None:
+        if value in (None, "", "-", "--", "None"):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if number != number:  # NaN
+            return None
+        return number
+
     def get_index_valuation(self, code: str) -> dict[str, Any]:
-        """指数/宽基 ETF 估值：东财 PE/PB + 可选中证 PE 分位。"""
+        """指数/宽基 ETF 估值：优先中证 PE/股息率，东财仅作名称补充。
+
+        说明：东财指数报价 pe/pb 常为 '-'；中证 indicator.xls 不含 PB。
+        pe_percentile 基于中证近期文件窗口（通常约 20 个交易日），不是全历史分位。
+        """
         raw = "".join(ch for ch in str(code) if ch.isdigit())[-6:]
         if not raw:
             raise MarketDataError("code required")
@@ -844,9 +920,20 @@ class MarketDataProvider:
                 "name": labels.get(index_code, index_code),
                 "pe": 12.8,
                 "pe_ttm": 12.8,
-                "pb": 1.45,
+                "pb": None,
                 "pe_percentile": 42.0,
-                "note": "ETF 报价 pe_ttm/pb 常为 0，请用本能力看对应指数估值",
+                "pe_percentile_window": 20,
+                "pe_percentile_basis": "csi_recent_file",
+                "pe_percentile_1y": None,
+                "pe_percentile_3y": None,
+                "pb": None,
+                "pb_status": "unavailable",
+                "dividend_yield_percent": 2.5,
+                "as_of": date.today().isoformat(),
+                "note": (
+                    "ETF 快照 pe_ttm/pb 常为 0/-，请用本能力。"
+                    "PB 中证未提供；pe_percentile 仅为中证近期文件窗口分位，非 1年/3年/全历史。"
+                ),
                 "source": "mock",
             }
         out: dict[str, Any] = {
@@ -856,9 +943,21 @@ class MarketDataProvider:
             "pe": None,
             "pe_ttm": None,
             "pb": None,
+            "pb_status": "unavailable",
             "pe_percentile": None,
-            "note": "ETF 快照 pe_ttm/pb 常为 0，已映射到对应指数",
-            "source": "eastmoney_ulist",
+            "pe_percentile_window": None,
+            "pe_percentile_basis": None,
+            "pe_percentile_1y": None,
+            "pe_percentile_3y": None,
+            "dividend_yield_percent": None,
+            "as_of": None,
+            "note": (
+                "ETF/指数快照 pe_ttm、pb 常为 0 或 '-'；"
+                "PE 与股息率来自中证近期估值文件。"
+                "pb_status=unavailable（中证 indicator.xls 无 PB）；"
+                "pe_percentile 仅为该文件近期窗口分位，1y/3y 全历史分位暂无同源数据。"
+            ),
+            "source": None,
         }
         try:
             rows = self._eastmoney_ulist(
@@ -868,9 +967,16 @@ class MarketDataProvider:
             if rows:
                 row = rows[0]
                 out["name"] = row.get("f14") or out["name"]
-                out["pe"] = row.get("f9")
-                out["pe_ttm"] = row.get("f115") if row.get("f115") not in (None, "-", 0) else row.get("f9")
-                out["pb"] = row.get("f23")
+                pe = self._num_or_none(row.get("f9"))
+                pe_ttm = self._num_or_none(row.get("f115")) or pe
+                pb = self._num_or_none(row.get("f23"))
+                if pe is not None:
+                    out["pe"] = pe
+                if pe_ttm is not None:
+                    out["pe_ttm"] = pe_ttm
+                if pb is not None:
+                    out["pb"] = pb
+                out["source"] = "eastmoney_ulist"
         except Exception as exc:  # noqa: BLE001
             out["ulist_error"] = str(exc)[:300]
         try:
@@ -882,21 +988,34 @@ class MarketDataProvider:
                 pes = [
                     float(r["pe_calculation"])
                     for r in recs
-                    if r.get("pe_calculation") not in (None, "")
+                    if self._num_or_none(r.get("pe_calculation")) is not None
                 ]
                 if pes:
                     latest = pes[-1]
                     out["csi_pe"] = latest
+                    out["pe"] = latest
+                    out["pe_ttm"] = latest
                     out["pe_percentile"] = round(
                         sum(1 for x in pes if x <= latest) / len(pes) * 100, 1
                     )
-                    if out.get("pe") in (None, 0, "-"):
-                        out["pe"] = latest
-                    out["source"] = "eastmoney_ulist+csi"
+                    out["pe_percentile_window"] = len(pes)
+                    out["pe_percentile_basis"] = "csi_recent_file"
+                    # 显式占位：避免 Agent 把近期窗口误当成 1年/全历史分位
+                    out["pe_percentile_1y"] = None
+                    out["pe_percentile_3y"] = None
+                    last = recs[-1]
+                    out["as_of"] = last.get("date")
+                    out["dividend_yield_percent"] = self._num_or_none(
+                        last.get("dividend_yield_calculation_percent")
+                    )
+                    out["pe_total"] = self._num_or_none(last.get("pe_total"))
+                    out["source"] = (
+                        "csi+eastmoney_ulist" if out.get("source") else "csi"
+                    )
         except Exception as exc:  # noqa: BLE001
             out["csi_error"] = str(exc)[:300]
-        if out.get("pe") in (None, 0, "-") and out.get("pb") in (None, 0, "-"):
-            out["error"] = out.get("ulist_error") or out.get("csi_error") or "valuation empty"
+        if out.get("pe") is None and out.get("pb") is None:
+            out["error"] = out.get("csi_error") or out.get("ulist_error") or "valuation empty"
         return out
 
     def get_market_breadth(self) -> dict[str, Any]:
@@ -1072,41 +1191,128 @@ class MarketDataProvider:
             ),
         }
 
+        concept_hot = [r for r in (concept.get("top") or []) if not _is_concept_noise(r)]
+        concept_cold = [r for r in (concept.get("bottom") or []) if not _is_concept_noise(r)]
+        filtered_noise = [
+            {"code": r.get("code"), "name": r.get("name")}
+            for r in (concept.get("top") or []) + (concept.get("bottom") or [])
+            if _is_concept_noise(r)
+        ]
+
+        hsgt, err = self._try_section("hsgt_flow", self.get_hsgt_flow)
+        if err:
+            degraded.append(err)
+            hsgt = None
+
         gaps = ["尚无「大盘动态」文字快讯流"]
         if not breadth or not breadth.get("histogram"):
             gaps.insert(0, "涨跌分布直方图暂不可用，已降级")
         if not valuation:
             gaps.insert(0, "指数估值暂不可用，已降级")
+        if valuation and valuation.get("pb_status") == "unavailable":
+            gaps.insert(0, "指数 PB 暂无同源数据（pb_status=unavailable）")
+        if valuation and valuation.get("pe_percentile_1y") is None:
+            gaps.insert(0, "指数 1年/3年 PE 分位暂无同源数据，仅有近期窗口分位")
+        if not hsgt:
+            gaps.insert(0, "北向/沪深港通资金暂不可用")
 
         return {
             "as_of": datetime.now().isoformat(timespec="seconds"),
             "indices": indices,
             "index_valuation": valuation,
+            "hsgt": hsgt,
             "industry": {
-                "leaders": industry.get("top", []),
-                "laggards": industry.get("bottom", []),
+                "leaders": _compact_board_rows(industry.get("top")),
+                "laggards": _compact_board_rows(industry.get("bottom")),
                 "total": industry.get("total", 0),
             },
             "concept": {
-                "hot": concept.get("top", []),
-                "cold": concept.get("bottom", []),
+                "hot": _compact_board_rows(concept_hot[:top_n]),
+                "cold": _compact_board_rows(concept_cold[:top_n]),
                 "total": concept.get("total", 0),
+                "filtered_noise_count": len(filtered_noise),
             },
             "industry_fund_flow": {
                 "period": "today",
-                "inflow": fund.get("inflow", []),
-                "outflow": fund.get("outflow", []),
+                "inflow": _compact_board_rows(fund.get("inflow")),
+                "outflow": _compact_board_rows(fund.get("outflow")),
+                "note": "概览已压缩字段；完整主力分项请再调 get_board_fund_flow",
             },
             "breadth": breadth,
             "breadth_proxy": breadth_proxy,
             "degraded": degraded,
             "sources": [
                 "tencent_quote(indices)",
-                "eastmoney clist (retry + push2delay)",
-                "eastmoney ulist / getTopicZDFenBu",
+                "eastmoney clist (retry + push2delay) / sina fallback",
+                "eastmoney ulist / getTopicZDFenBu / kamt",
                 "csi index_valuation (optional)",
             ],
             "gaps": gaps,
+        }
+
+    def get_hsgt_flow(self) -> dict[str, Any]:
+        """沪深港通 / 北向资金概览（东财 kamt）。金额单位为万元。"""
+        if self.mode == "mock":
+            return {
+                "as_of": date.today().isoformat(),
+                "northbound": {
+                    "day_net_wan": 35_000.0,
+                    "hk2sh_day_net_wan": 18_000.0,
+                    "hk2sz_day_net_wan": 17_000.0,
+                },
+                "southbound": {
+                    "day_net_wan": -8_000.0,
+                },
+                "unit": "万元",
+                "source": "mock",
+            }
+
+        query = urllib.parse.urlencode(
+            {
+                "fields1": "f1,f2,f3,f4",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+                "ut": "b2884a393a59ad64002292a3e90d46a5",
+            }
+        )
+        payload = self._http_json(self._eastmoney_urls("/api/qt/kamt/get", query))
+        data = (payload or {}).get("data") or {}
+        if not data:
+            raise MarketDataError("hsgt kamt empty")
+
+        def _leg(key: str) -> dict[str, Any]:
+            row = data.get(key) or {}
+            return {
+                "status": row.get("status"),
+                "day_net_wan": self._num_or_none(row.get("dayNetAmtIn")),
+                "day_remain_wan": self._num_or_none(row.get("dayAmtRemain")),
+                "day_quota_wan": self._num_or_none(row.get("dayAmtThreshold")),
+                "month_net_wan": self._num_or_none(row.get("monthNetAmtIn")),
+                "buy_wan": self._num_or_none(row.get("buyAmt")),
+                "sell_wan": self._num_or_none(row.get("sellAmt")),
+                "date": row.get("date2") or row.get("date"),
+            }
+
+        hk2sh = _leg("hk2sh")
+        hk2sz = _leg("hk2sz")
+        sh2hk = _leg("sh2hk")
+        sz2hk = _leg("sz2hk")
+        north = (hk2sh.get("day_net_wan") or 0.0) + (hk2sz.get("day_net_wan") or 0.0)
+        south = (sh2hk.get("day_net_wan") or 0.0) + (sz2hk.get("day_net_wan") or 0.0)
+        return {
+            "as_of": hk2sh.get("date") or sh2hk.get("date"),
+            "northbound": {
+                "day_net_wan": round(north, 2),
+                "hk2sh": hk2sh,
+                "hk2sz": hk2sz,
+            },
+            "southbound": {
+                "day_net_wan": round(south, 2),
+                "sh2hk": sh2hk,
+                "sz2hk": sz2hk,
+            },
+            "unit": "万元",
+            "note": "day_net_wan>0 为净流入；休市或额度用尽时可能为 0",
+            "source": "eastmoney kamt",
         }
 
     def _batch_quotes(

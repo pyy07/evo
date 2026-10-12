@@ -317,6 +317,7 @@ def invocations_for_run(db: Session, run: AgentRun) -> list[dict[str, Any]]:
                 "get_board_fund_flow",
                 "get_index_valuation",
                 "get_market_breadth",
+                "get_hsgt_flow",
                 "take_portfolio_snapshot",
                 "settle_day",
                 "get_day_report",

@@ -51,6 +51,26 @@ def truncate_result(result: Any, limit: int = 6000) -> str:
     text = json.dumps(result, ensure_ascii=False, default=str)
     if len(text) <= limit:
         return text
+    # 大盘综合优先保住指数/估值/资金流摘要，避免截在 industry_fund_flow 中间
+    if isinstance(result, dict) and (
+        "industry_fund_flow" in result or "index_valuation" in result or "hsgt" in result
+    ):
+        slim = {
+            "as_of": result.get("as_of"),
+            "indices": result.get("indices"),
+            "index_valuation": result.get("index_valuation"),
+            "hsgt": result.get("hsgt"),
+            "industry": result.get("industry"),
+            "concept": result.get("concept"),
+            "industry_fund_flow": result.get("industry_fund_flow"),
+            "breadth": result.get("breadth") or result.get("breadth_proxy"),
+            "degraded": result.get("degraded"),
+            "gaps": result.get("gaps"),
+            "note": "输出已按关键分项压缩；完整资金流请再调 get_board_fund_flow",
+        }
+        text = json.dumps(slim, ensure_ascii=False, default=str)
+        if len(text) <= limit:
+            return text
     return text[: limit - 20] + "...(truncated)"
 
 

@@ -123,7 +123,57 @@ def test_mock_index_valuation_and_breadth():
     p = MarketDataProvider(mode="mock")
     val = p.get_index_valuation("510300")
     assert val["index_code"] == "000300"
-    assert val["pe"] > 0 and val["pb"] > 0
+    assert val["pe"] > 0
+    assert val["pe_ttm"] > 0
+    assert val["pe_percentile"] is not None
+    assert val["pb"] is None  # 中证估值文件不含 PB
+    assert val["pb_status"] == "unavailable"
+    assert val["pe_percentile_1y"] is None
     breadth = p.get_market_breadth()
     assert breadth["up"] > 0
     assert any(x["label"] == "涨停" for x in breadth["histogram"])
+    hsgt = p.get_hsgt_flow()
+    assert hsgt["northbound"]["day_net_wan"] != 0
+    assert "510050" in {m["code"] for m in p.list_universe(stock_type="etf")}
+    assert "512890" in {m["code"] for m in p.list_universe(stock_type="etf")}
+
+
+def test_overview_filters_concept_noise_and_compacts():
+    p = MarketDataProvider(mode="mock")
+
+    def noisy_concept(*, top_n=10, board="concept"):
+        return {
+            "board": board,
+            "top": [
+                {"rank": 1, "code": "BK0481", "name": "半导体", "change_pct": 2.0},
+                {"rank": 2, "code": "BK1645", "name": "昨日打二板以上表现", "change_pct": 3.0},
+                {"rank": 3, "code": "BK1675", "name": "历史新高", "change_pct": 2.5},
+            ],
+            "bottom": [{"rank": 99, "code": "BK1050", "name": "昨日涨停_含一字", "change_pct": -1}],
+            "total": 3,
+        }
+
+    p.industry_comparison = (  # type: ignore[method-assign]
+        lambda **kwargs: noisy_concept(**kwargs)
+        if kwargs.get("board") == "concept"
+        else {
+            "board": "industry",
+            "top": [{"rank": 1, "code": "BK01", "name": "银行", "change_pct": 1}],
+            "bottom": [],
+            "total": 1,
+        }
+    )
+    overview = p.get_market_overview(top_n=3)
+    hot_names = [x["name"] for x in overview["concept"]["hot"]]
+    assert "半导体" in hot_names
+    assert all("涨停" not in n and "新高" not in n and "打二板" not in n for n in hot_names)
+    assert overview["concept"]["filtered_noise_count"] >= 1
+    assert "hsgt" in overview
+    assert "main_net" in (overview["industry_fund_flow"]["inflow"][0] or {})
+
+
+def test_num_or_none_cleans_eastmoney_dashes():
+    assert MarketDataProvider._num_or_none("-") is None
+    assert MarketDataProvider._num_or_none("--") is None
+    assert MarketDataProvider._num_or_none("16.21") == 16.21
+    assert MarketDataProvider._num_or_none(0) == 0.0

@@ -78,15 +78,23 @@ kinds:
       source: market
       # mock / 行情失败时的种子池
       seed_codes:
+        # 宽基 / 风格：大盘价值与红利需可落地
         - {code: "510300", name: "沪深300ETF"}
+        - {code: "510050", name: "上证50ETF"}
         - {code: "510500", name: "中证500ETF"}
         - {code: "159915", name: "创业板ETF"}
         - {code: "588000", name: "科创50ETF"}
         - {code: "512100", name: "1000ETF"}
+        - {code: "512890", name: "红利低波ETF"}
+        - {code: "563020", name: "中证红利ETF"}
+        - {code: "515080", name: "中证红利ETF"}
+        - {code: "510880", name: "红利ETF"}
+        - {code: "159905", name: "深红利ETF"}
         - {code: "513100", name: "纳指ETF"}
         - {code: "513500", name: "标普500ETF"}
         - {code: "511010", name: "国债ETF"}
         - {code: "518880", name: "黄金ETF"}
+        # 主题
         - {code: "512480", name: "半导体ETF"}
         - {code: "159819", name: "人工智能ETF"}
         - {code: "512880", name: "证券ETF"}

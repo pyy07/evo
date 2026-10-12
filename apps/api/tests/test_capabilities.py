@@ -88,6 +88,10 @@ def test_market_overview_capability(client):
     breadth = _invoke(client, "get_market_breadth")
     assert breadth.status_code == 200
     assert breadth.json()["result"]["histogram"]
+    hsgt = _invoke(client, "get_hsgt_flow")
+    assert hsgt.status_code == 200
+    assert "northbound" in hsgt.json()["result"]
+    assert body.get("hsgt") is not None or body.get("degraded") is not None
     hist = _invoke(client, "get_etf_history", {"code": "510300", "count": 12})
     assert hist.status_code == 200
     hbody = hist.json()["result"]
