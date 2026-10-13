@@ -55,6 +55,7 @@ def truncate_result(result: Any, limit: int = 6000) -> str:
     if isinstance(result, dict) and (
         "industry_fund_flow" in result or "index_valuation" in result or "hsgt" in result
     ):
+        fund = result.get("industry_fund_flow") or {}
         slim = {
             "as_of": result.get("as_of"),
             "indices": result.get("indices"),
@@ -62,12 +63,24 @@ def truncate_result(result: Any, limit: int = 6000) -> str:
             "hsgt": result.get("hsgt"),
             "industry": result.get("industry"),
             "concept": result.get("concept"),
-            "industry_fund_flow": result.get("industry_fund_flow"),
+            "industry_fund_flow": {
+                "period": fund.get("period"),
+                "top_n": fund.get("top_n"),
+                "inflow": (fund.get("inflow") or [])[:4],
+                "outflow": (fund.get("outflow") or [])[:4],
+                "note": fund.get("note") or "完整资金流请调 get_board_fund_flow",
+            },
             "breadth": result.get("breadth") or result.get("breadth_proxy"),
             "degraded": result.get("degraded"),
             "gaps": result.get("gaps"),
             "note": "输出已按关键分项压缩；完整资金流请再调 get_board_fund_flow",
         }
+        text = json.dumps(slim, ensure_ascii=False, default=str)
+        if len(text) <= limit:
+            return text
+        # 仍超限则再砍概念/行业细节，保住估值与北向
+        slim["concept"] = {"hot": ((result.get("concept") or {}).get("hot") or [])[:3]}
+        slim["industry"] = {"leaders": ((result.get("industry") or {}).get("leaders") or [])[:3]}
         text = json.dumps(slim, ensure_ascii=False, default=str)
         if len(text) <= limit:
             return text

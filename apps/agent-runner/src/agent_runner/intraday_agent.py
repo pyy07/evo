@@ -19,6 +19,7 @@ INTRADAY_CAPABILITY_TOOLS = frozenset(
         "get_index_valuation",
         "get_market_breadth",
         "get_hsgt_flow",
+        "get_etf_premium",
         "get_market_news",
         "get_announcements",
         "get_macro_digest",

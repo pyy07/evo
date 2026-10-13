@@ -190,8 +190,8 @@ CAPABILITIES: list[dict[str, Any]] = [
         "name": "指数/ETF估值",
         "description": (
             "指数或宽基 ETF 估值：优先中证 PE/股息率与近期窗口 PE 分位；"
-            "ETF 快照 pe_ttm/pb 常为 0 或 '-'，510300 会映射到 000300。"
-            "中证文件不含 PB，pb 可能为 null；pe_percentile 非全历史分位。"
+            "返回 pe_percentile_window_start/end。ETF 快照 pe_ttm/pb 常为 0 或 '-'。"
+            "pb_status=unavailable；pe_percentile_1y/3y 无同源时长为 null，勿当作全历史分位。"
         ),
         "category": "market",
         "input_schema": {
@@ -222,14 +222,38 @@ CAPABILITIES: list[dict[str, Any]] = [
         "id": "get_hsgt_flow",
         "name": "北向/沪深港通资金",
         "description": (
-            "沪深港通额度与净流入（东财 kamt）。返回 northbound/southbound 的日净流入（万元）。"
-            "用于验证外资集中度与风格切换，不替代行业资金流。"
+            "沪深港通资金真源：北向优先返回成交额（RPT_MUTUAL_DEALAMT）；"
+            "净买入仅在 kamt 买卖可核对时给出，否则 net_buy_status=unavailable、"
+            "usable_for_style=false。禁止把额度字段当净流入。单位万元。"
         ),
         "category": "market",
         "input_schema": {"type": "object", "properties": {}},
         "output_schema": {"type": "object"},
         "permission": "agent",
         "implementation": "get_hsgt_flow",
+    },
+    {
+        "id": "get_etf_premium",
+        "name": "ETF溢折价",
+        "description": (
+            "ETF 市价相对最新净值的溢折价（东财 FundMNFInfo）。"
+            "premium_pct=(市价-净值)/净值*100。份额变动/净申赎无同源时标 unavailable，不编造。"
+        ),
+        "category": "market",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "ETF 代码列表，最多 12 个",
+                },
+            },
+            "required": ["codes"],
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_etf_premium",
     },
     {
         "id": "get_market_news",

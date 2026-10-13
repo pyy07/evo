@@ -313,8 +313,17 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
     if impl == "get_hsgt_flow":
         return _market_soft(
             lambda: get_provider().get_hsgt_flow(),
-            {"northbound": {}, "southbound": {}, "unit": "万元"},
+            {
+                "northbound": {"net_buy_status": "unavailable"},
+                "southbound": {"net_buy_status": "unavailable"},
+                "usable_for_style": False,
+                "unit": "万元",
+            },
         )
+
+    if impl == "get_etf_premium":
+        codes = _require(payload, "codes")
+        return get_provider().get_etf_premium(list(codes))
 
     if impl == "get_market_news":
         scope = str(payload.get("scope") or "market")

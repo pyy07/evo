@@ -90,7 +90,13 @@ def test_market_overview_capability(client):
     assert breadth.json()["result"]["histogram"]
     hsgt = _invoke(client, "get_hsgt_flow")
     assert hsgt.status_code == 200
-    assert "northbound" in hsgt.json()["result"]
+    hbody = hsgt.json()["result"]
+    assert "northbound" in hbody
+    assert hbody["northbound"].get("net_buy_status") in ("unavailable", "ok")
+    assert "usable_for_style" in hbody
+    prem = _invoke(client, "get_etf_premium", {"codes": ["510300"]})
+    assert prem.status_code == 200
+    assert prem.json()["result"]["items"][0]["premium_pct"] is not None
     assert body.get("hsgt") is not None or body.get("degraded") is not None
     hist = _invoke(client, "get_etf_history", {"code": "510300", "count": 12})
     assert hist.status_code == 200

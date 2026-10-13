@@ -38,6 +38,54 @@ def _is_concept_noise(row: dict[str, Any]) -> bool:
     return any(key in name for key in _CONCEPT_NOISE_NAME_KEYS)
 
 
+def _board_level_rank(name: str) -> int:
+    """板块层级：0=主层级，1=Ⅱ，2=Ⅲ；数值越小越优先保留。"""
+    n = str(name or "").strip()
+    if not n:
+        return 0
+    if re.search(r"(Ⅲ|III|III类|三级)\s*$", n):
+        return 2
+    if re.search(r"(Ⅱ|II)\s*$", n):
+        return 1
+    return 0
+
+
+def _board_base_name(name: str) -> str:
+    n = str(name or "").strip()
+    n = re.sub(r"(Ⅲ|III|III类|三级)\s*$", "", n)
+    n = re.sub(r"(Ⅱ|II)\s*$", "", n)
+    return n.strip()
+
+
+def _dedupe_board_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """按主层级去重：同 basename 优先保留无Ⅱ/Ⅲ后缀；同 code 只留一条。"""
+    best: dict[str, tuple[int, dict[str, Any]]] = {}
+    order: list[str] = []
+    seen_codes: set[str] = set()
+    for row in rows or []:
+        code = str(row.get("code") or "").strip()
+        if code and code in seen_codes:
+            continue
+        name = str(row.get("name") or "")
+        base = _board_base_name(name) or code or name
+        level = _board_level_rank(name)
+        if base not in best:
+            best[base] = (level, row)
+            order.append(base)
+            if code:
+                seen_codes.add(code)
+            continue
+        prev_level, _prev = best[base]
+        if level < prev_level:
+            prev_code = str(_prev.get("code") or "").strip()
+            if prev_code:
+                seen_codes.discard(prev_code)
+            best[base] = (level, row)
+            if code:
+                seen_codes.add(code)
+    return [best[k][1] for k in order]
+
+
 def _compact_board_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """概览里只保留必要字段，避免 tool 输出被 6k 截断后丢掉资金流尾部。"""
     out: list[dict[str, Any]] = []
@@ -171,8 +219,10 @@ _MOCK_ETF_UNIVERSE: list[dict[str, str]] = [
     {"code": "511880", "name": "银华日利"},
 ]
 
-# 概念榜里的交易统计型板块（非主题），干扰风格/主题判断
-_CONCEPT_NOISE_CODES = frozenset({"BK1645", "BK1675", "BK1050", "BK0815", "BK0816"})
+# 概念榜里的交易统计/财报统计型板块（非主题），干扰风格/主题判断
+_CONCEPT_NOISE_CODES = frozenset(
+    {"BK1645", "BK1675", "BK1050", "BK0815", "BK0816", "BK1199", "BK1750"}
+)
 _CONCEPT_NOISE_NAME_KEYS = (
     "打板",
     "打二板",
@@ -186,6 +236,15 @@ _CONCEPT_NOISE_NAME_KEYS = (
     "昨日",
     "晋级",
     "破板",
+    "预减",
+    "预增",
+    "扭亏",
+    "增亏",
+    "中报",
+    "季报",
+    "年报",
+    "业绩预告",
+    "业绩快报",
 )
 
 # 常见宽基 ETF → 中证/国证指数（估值）
@@ -563,11 +622,14 @@ class MarketDataProvider:
         page_size: int,
         fields: str = "f12,f14",
         fid: str = "f3",
+        po: str = "1",
     ) -> list[dict[str, Any]]:
+        # po: "1"=降序（强/流入端），"0"=升序（弱/流出端）
+        po_v = "0" if str(po) in {"0", "asc", "ascending"} else "1"
         params = {
             "pn": str(page),
             "pz": str(page_size),
-            "po": "1",
+            "po": po_v,
             "np": "1",
             "fltt": "2",
             "invt": "2",
@@ -576,7 +638,7 @@ class MarketDataProvider:
             "fields": fields,
         }
         query = urllib.parse.urlencode(params)
-        cache_key = f"{fs}|{page}|{page_size}|{fields}|{fid}"
+        cache_key = f"{fs}|{page}|{page_size}|{fields}|{fid}|{po_v}"
         try:
             payload = self._http_json(self._eastmoney_urls("/api/qt/clist/get", query))
         except MarketDataError:
@@ -599,6 +661,32 @@ class MarketDataProvider:
         if out:
             self._clist_cache[cache_key] = (time.time(), out)
         return out
+
+    @staticmethod
+    def _map_board_rank_rows(
+        items: list[dict[str, Any]],
+        *,
+        change_key: str = "f3",
+        up_key: str = "f104",
+        down_key: str = "f105",
+        leader_key: str = "f140",
+        leader_chg_key: str = "f136",
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for i, item in enumerate(items):
+            rows.append(
+                {
+                    "rank": i + 1,
+                    "name": item.get("name") or item.get("f14") or "",
+                    "code": item.get("code") or item.get("f12") or "",
+                    "change_pct": item.get(change_key, 0),
+                    "up_count": item.get(up_key, 0),
+                    "down_count": item.get(down_key, 0),
+                    "leader": item.get(leader_key, ""),
+                    "leader_change": item.get(leader_chg_key, 0),
+                }
+            )
+        return rows
 
     def _sina_hy_boards(self) -> list[dict[str, Any]]:
         url = "https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
@@ -641,7 +729,7 @@ class MarketDataProvider:
         return rows
 
     def _sina_industry_comparison(self, *, top_n: int, board: str) -> dict[str, Any]:
-        rows = self._sina_hy_boards()
+        rows = _dedupe_board_rows(self._sina_hy_boards())
         ranked = [
             {
                 "rank": i + 1,
@@ -655,11 +743,19 @@ class MarketDataProvider:
             }
             for i, r in enumerate(rows)
         ]
+        laggards = list(reversed(ranked[-top_n:])) if ranked else []
+        for i, row in enumerate(laggards):
+            row = dict(row)
+            row["rank"] = i + 1
+            laggards[i] = row
         return {
             "board": board,
             "top": ranked[:top_n],
-            "bottom": ranked[-top_n:] if ranked else [],
+            "bottom": laggards,
             "total": len(ranked),
+            "sort": "change_pct",
+            "bottom_order": "weakest_first",
+            "universe_note": "新浪行业全样本；bottom 为涨跌幅升序最弱端",
             "source": "sina newSinaHy (eastmoney clist fallback)",
         }
 
@@ -681,7 +777,7 @@ class MarketDataProvider:
                 "main_pct": 0,
                 "leader": r.get("leader") or "",
             }
-            for i, r in enumerate(rows)
+            for i, r in enumerate(_dedupe_board_rows(rows))
         ]
         return {
             "board_type": board_type,
@@ -690,6 +786,7 @@ class MarketDataProvider:
             "inflow": mapped[:top_n],
             "outflow": list(reversed(mapped[-top_n:])) if mapped else [],
             "metric": "turnover",
+            "outflow_basis": "least_turnover",
             "note": "东财资金流暂不可用，已降级为新浪行业成交额（非主力净流入）",
             "source": "sina newSinaHy",
         }
@@ -722,37 +819,66 @@ class MarketDataProvider:
                     ]
                 )
             ]
+            bottom = list(reversed(rows))[:top_n]
+            for i, row in enumerate(bottom):
+                bottom[i] = {**row, "rank": i + 1}
             return {
                 "board": board,
                 "top": rows[:top_n],
-                "bottom": list(reversed(rows))[:top_n],
+                "bottom": bottom,
                 "total": len(rows),
+                "sort": "change_pct",
+                "bottom_order": "weakest_first",
+                "universe_note": "mock 全样本；bottom 为涨跌幅最弱端",
             }
         fields = "f2,f3,f4,f12,f13,f14,f104,f105,f128,f136,f140,f141,f207"
         try:
-            items = self._eastmoney_clist(fs=fs, page=1, page_size=100, fields=fields, fid="f3")
+            # 两端分别按涨跌幅降/升序取样，避免「前100强尾部」冒充全市场最弱
+            strong = self._eastmoney_clist(
+                fs=fs, page=1, page_size=100, fields=fields, fid="f3", po="1"
+            )
+            weak = self._eastmoney_clist(
+                fs=fs, page=1, page_size=100, fields=fields, fid="f3", po="0"
+            )
         except Exception:
             return self._sina_industry_comparison(top_n=top_n, board=board)
-        rows = []
-        for i, item in enumerate(items):
-            rows.append(
-                {
-                    "rank": i + 1,
-                    "name": item.get("name") or item.get("f14") or "",
-                    "code": item.get("code") or item.get("f12") or "",
-                    "change_pct": item.get("f3", 0),
-                    "up_count": item.get("f104", 0),
-                    "down_count": item.get("f105", 0),
-                    "leader": item.get("f140", ""),
-                    "leader_change": item.get("f136", 0),
-                }
-            )
-        return {
+        top_rows = _dedupe_board_rows(self._map_board_rank_rows(strong))
+        bottom_rows = _dedupe_board_rows(self._map_board_rank_rows(weak))
+        filtered_noise: list[dict[str, Any]] = []
+        if board == "concept":
+            kept_top: list[dict[str, Any]] = []
+            kept_bottom: list[dict[str, Any]] = []
+            for r in top_rows:
+                if _is_concept_noise(r):
+                    filtered_noise.append({"code": r.get("code"), "name": r.get("name"), "side": "top"})
+                else:
+                    kept_top.append(r)
+            for r in bottom_rows:
+                if _is_concept_noise(r):
+                    filtered_noise.append({"code": r.get("code"), "name": r.get("name"), "side": "bottom"})
+                else:
+                    kept_bottom.append(r)
+            top_rows, bottom_rows = kept_top, kept_bottom
+        top = [{**r, "rank": i + 1} for i, r in enumerate(top_rows[:top_n])]
+        bottom = [{**r, "rank": i + 1} for i, r in enumerate(bottom_rows[:top_n])]
+        result: dict[str, Any] = {
             "board": board,
-            "top": rows[:top_n],
-            "bottom": rows[-top_n:] if rows else [],
-            "total": len(rows),
+            "top": top,
+            "bottom": bottom,
+            "total": max(len(top_rows), len(bottom_rows)),
+            "sort": "change_pct",
+            "bottom_order": "weakest_first",
+            "universe_note": (
+                "东财行业/概念板块榜按涨跌幅两端取样（非前100强尾部）；"
+                "已按主层级去重（同名优先保留无Ⅱ/Ⅲ后缀）"
+                + ("；概念已过滤交易/财报统计标签" if board == "concept" else "")
+            ),
+            "source": "eastmoney clist",
         }
+        if board == "concept":
+            result["filtered_noise"] = filtered_noise
+            result["filtered_noise_count"] = len(filtered_noise)
+        return result
 
     def board_fund_flow(
         self,
@@ -809,6 +935,8 @@ class MarketDataProvider:
                 "total": len(rows),
                 "inflow": rows[:2],
                 "outflow": [rows[-1]],
+                "outflow_basis": "main_net_negative",
+                "note": "mock：outflow 为 main_net<0",
             }
         fid, f_main, f_pct, f_chg, f_leader = period_map[period]
         fields = ["f12", "f14", f_chg, f_main, f_pct]
@@ -816,45 +944,84 @@ class MarketDataProvider:
             fields.append(f_leader)
         if period == "today":
             fields.extend(["f66", "f72", "f78", "f84"])
+        field_str = ",".join(dict.fromkeys(fields))
+        page_size = max(top_n * 3, 50)
+
+        def _map_flow(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            mapped: list[dict[str, Any]] = []
+            for it in items:
+                row = {
+                    "name": it.get("name") or it.get("f14") or "",
+                    "code": it.get("code") or it.get("f12") or "",
+                    "change_pct": it.get(f_chg, 0),
+                    "main_net": it.get(f_main, 0),
+                    "main_pct": it.get(f_pct, 0),
+                    "leader": it.get(f_leader, "") if f_leader else "",
+                }
+                if period == "today":
+                    row.update(
+                        {
+                            "super_large_net": it.get("f66", 0),
+                            "large_net": it.get("f72", 0),
+                            "medium_net": it.get("f78", 0),
+                            "small_net": it.get("f84", 0),
+                        }
+                    )
+                mapped.append(row)
+            return _dedupe_board_rows(mapped)
+
         try:
-            items = self._eastmoney_clist(
+            inflow_items = self._eastmoney_clist(
                 fs=board_fs[board_type],
                 page=1,
-                page_size=max(top_n * 2, 50),
-                fields=",".join(dict.fromkeys(fields)),
+                page_size=page_size,
+                fields=field_str,
                 fid=fid,
+                po="1",
+            )
+            outflow_items = self._eastmoney_clist(
+                fs=board_fs[board_type],
+                page=1,
+                page_size=page_size,
+                fields=field_str,
+                fid=fid,
+                po="0",
             )
         except Exception:
             return self._sina_board_turnover(top_n=top_n, board_type=board_type, period=period)
-        rows: list[dict[str, Any]] = []
-        for i, it in enumerate(items):
-            row = {
-                "rank": i + 1,
-                "name": it.get("name") or it.get("f14") or "",
-                "code": it.get("code") or it.get("f12") or "",
-                "change_pct": it.get(f_chg, 0),
-                "main_net": it.get(f_main, 0),
-                "main_pct": it.get(f_pct, 0),
-                "leader": it.get(f_leader, "") if f_leader else "",
-            }
-            if period == "today":
-                row.update(
-                    {
-                        "super_large_net": it.get("f66", 0),
-                        "large_net": it.get("f72", 0),
-                        "medium_net": it.get("f78", 0),
-                        "small_net": it.get("f84", 0),
-                    }
-                )
-            rows.append(row)
-        inflow = rows[:top_n]
-        outflow = list(reversed(rows[-top_n:])) if rows else []
+        inflow_rows = _map_flow(inflow_items)
+        outflow_rows = _map_flow(outflow_items)
+        if board_type == "concept":
+            inflow_rows = [r for r in inflow_rows if not _is_concept_noise(r)]
+            outflow_rows = [r for r in outflow_rows if not _is_concept_noise(r)]
+
+        def _net(row: dict[str, Any]) -> float:
+            try:
+                return float(row.get("main_net") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        true_out = [r for r in outflow_rows if _net(r) < 0]
+        if true_out:
+            outflow_sel = true_out[:top_n]
+            outflow_basis = "main_net_negative"
+            outflow_note = "真实主力净流出（main_net<0），按净流出从大到小"
+        else:
+            outflow_sel = outflow_rows[:top_n]
+            outflow_basis = "least_inflow"
+            outflow_note = "当日样本无 main_net<0，返回净流入最少尾部（数值仍可能为正）"
+
+        inflow = [{**r, "rank": i + 1} for i, r in enumerate(inflow_rows[:top_n])]
+        outflow = [{**r, "rank": i + 1} for i, r in enumerate(outflow_sel)]
         return {
             "board_type": board_type,
             "period": period,
-            "total": len(rows),
+            "total": max(len(inflow_rows), len(outflow_rows)),
             "inflow": inflow,
             "outflow": outflow,
+            "outflow_basis": outflow_basis,
+            "note": outflow_note + "；已按主层级去重",
+            "source": "eastmoney clist",
         }
 
     def _try_section(self, name: str, fn: Callable[[], Any]) -> tuple[Any, dict[str, str] | None]:
@@ -924,6 +1091,8 @@ class MarketDataProvider:
                 "pe_percentile": 42.0,
                 "pe_percentile_window": 20,
                 "pe_percentile_basis": "csi_recent_file",
+                "pe_percentile_window_start": (date.today() - timedelta(days=30)).isoformat(),
+                "pe_percentile_window_end": date.today().isoformat(),
                 "pe_percentile_1y": None,
                 "pe_percentile_3y": None,
                 "pb": None,
@@ -947,6 +1116,8 @@ class MarketDataProvider:
             "pe_percentile": None,
             "pe_percentile_window": None,
             "pe_percentile_basis": None,
+            "pe_percentile_window_start": None,
+            "pe_percentile_window_end": None,
             "pe_percentile_1y": None,
             "pe_percentile_3y": None,
             "dividend_yield_percent": None,
@@ -1000,6 +1171,9 @@ class MarketDataProvider:
                     )
                     out["pe_percentile_window"] = len(pes)
                     out["pe_percentile_basis"] = "csi_recent_file"
+                    dates = [str(r.get("date") or "") for r in recs if r.get("date")]
+                    out["pe_percentile_window_start"] = dates[0] if dates else None
+                    out["pe_percentile_window_end"] = dates[-1] if dates else None
                     # 显式占位：避免 Agent 把近期窗口误当成 1年/全历史分位
                     out["pe_percentile_1y"] = None
                     out["pe_percentile_3y"] = None
@@ -1191,13 +1365,24 @@ class MarketDataProvider:
             ),
         }
 
-        concept_hot = [r for r in (concept.get("top") or []) if not _is_concept_noise(r)]
-        concept_cold = [r for r in (concept.get("bottom") or []) if not _is_concept_noise(r)]
-        filtered_noise = [
-            {"code": r.get("code"), "name": r.get("name")}
-            for r in (concept.get("top") or []) + (concept.get("bottom") or [])
-            if _is_concept_noise(r)
-        ]
+        industry_leaders = _dedupe_board_rows(industry.get("top"))
+        industry_laggards = _dedupe_board_rows(industry.get("bottom"))
+        # industry_comparison(concept) 已过滤噪声；此处再兜底一遍并汇总计数
+        concept_hot = _dedupe_board_rows(
+            [r for r in (concept.get("top") or []) if not _is_concept_noise(r)]
+        )
+        concept_cold = _dedupe_board_rows(
+            [r for r in (concept.get("bottom") or []) if not _is_concept_noise(r)]
+        )
+        filtered_noise = list(concept.get("filtered_noise") or [])
+        if not filtered_noise:
+            filtered_noise = [
+                {"code": r.get("code"), "name": r.get("name")}
+                for r in (concept.get("top") or []) + (concept.get("bottom") or [])
+                if _is_concept_noise(r)
+            ]
+        # 概览内资金流只保留少量摘要，避免 6k 截断；完整列表用 get_board_fund_flow
+        flow_n = min(top_n, 4)
 
         hsgt, err = self._try_section("hsgt_flow", self.get_hsgt_flow)
         if err:
@@ -1215,6 +1400,8 @@ class MarketDataProvider:
             gaps.insert(0, "指数 1年/3年 PE 分位暂无同源数据，仅有近期窗口分位")
         if not hsgt:
             gaps.insert(0, "北向/沪深港通资金暂不可用")
+        elif hsgt.get("usable_for_style") is False:
+            gaps.insert(0, "北向净买入不可用（仅有成交额），不可作外资风格验证")
 
         return {
             "as_of": datetime.now().isoformat(timespec="seconds"),
@@ -1222,21 +1409,24 @@ class MarketDataProvider:
             "index_valuation": valuation,
             "hsgt": hsgt,
             "industry": {
-                "leaders": _compact_board_rows(industry.get("top")),
-                "laggards": _compact_board_rows(industry.get("bottom")),
+                "leaders": _compact_board_rows(industry_leaders[:top_n]),
+                "laggards": _compact_board_rows(industry_laggards[:top_n]),
                 "total": industry.get("total", 0),
+                "note": "已按主层级去重（同名优先保留无Ⅱ/Ⅲ后缀）；laggards 为涨跌幅最弱端",
             },
             "concept": {
                 "hot": _compact_board_rows(concept_hot[:top_n]),
                 "cold": _compact_board_rows(concept_cold[:top_n]),
                 "total": concept.get("total", 0),
                 "filtered_noise_count": len(filtered_noise),
+                "note": "已过滤打板/涨停/新高及季报预减/中报扭亏等统计标签",
             },
             "industry_fund_flow": {
                 "period": "today",
-                "inflow": _compact_board_rows(fund.get("inflow")),
-                "outflow": _compact_board_rows(fund.get("outflow")),
-                "note": "概览已压缩字段；完整主力分项请再调 get_board_fund_flow",
+                "inflow": _compact_board_rows(_dedupe_board_rows(fund.get("inflow"))[:flow_n]),
+                "outflow": _compact_board_rows(_dedupe_board_rows(fund.get("outflow"))[:flow_n]),
+                "top_n": flow_n,
+                "note": f"概览仅摘要前 {flow_n}；完整主力分项请调 get_board_fund_flow",
             },
             "breadth": breadth,
             "breadth_proxy": breadth_proxy,
@@ -1244,75 +1434,277 @@ class MarketDataProvider:
             "sources": [
                 "tencent_quote(indices)",
                 "eastmoney clist (retry + push2delay) / sina fallback",
-                "eastmoney ulist / getTopicZDFenBu / kamt",
+                "eastmoney ulist / getTopicZDFenBu / RPT_MUTUAL_DEALAMT / kamt",
                 "csi index_valuation (optional)",
             ],
             "gaps": gaps,
         }
 
+    def _eastmoney_datacenter(
+        self, report_name: str, *, page_size: int = 5, extra: dict[str, str] | None = None
+    ) -> list[dict[str, Any]]:
+        params = {
+            "reportName": report_name,
+            "columns": "ALL",
+            "sortColumns": "TRADE_DATE",
+            "sortTypes": "-1",
+            "pageSize": str(page_size),
+            "pageNumber": "1",
+        }
+        if extra:
+            params.update(extra)
+        query = urllib.parse.urlencode(params)
+        payload = self._http_json(
+            [f"https://datacenter-web.eastmoney.com/api/data/v1/get?{query}"]
+        )
+        if not (payload or {}).get("success"):
+            raise MarketDataError(
+                f"datacenter {report_name}: {(payload or {}).get('message') or 'failed'}"
+            )
+        rows = ((payload or {}).get("result") or {}).get("data") or []
+        return [r for r in rows if isinstance(r, dict)]
+
+    @staticmethod
+    def _net_buy_usable(buy: float | None, sell: float | None, net: float | None) -> bool:
+        """仅在买卖成交可核对时采信净买入；额度字段不可当净流入。"""
+        if net is None or buy is None or sell is None:
+            return False
+        if buy == 0 and sell == 0:
+            return False
+        # 允许撮合/四舍五入误差
+        return abs((buy - sell) - net) <= max(1.0, abs(net) * 0.05)
+
     def get_hsgt_flow(self) -> dict[str, Any]:
-        """沪深港通 / 北向资金概览（东财 kamt）。金额单位为万元。"""
+        """沪深港通资金：优先披露成交额；北向净买入不可用时明确 degraded。
+
+        注意：东财 kamt 北向 dayNetAmtIn/monthNetAmtIn 在监管披露收紧后常等于额度或为 0，
+        不能当作净买入。本能力不编造净买入。
+        """
         if self.mode == "mock":
             return {
                 "as_of": date.today().isoformat(),
                 "northbound": {
-                    "day_net_wan": 35_000.0,
-                    "hk2sh_day_net_wan": 18_000.0,
-                    "hk2sz_day_net_wan": 17_000.0,
+                    "deal_amt_wan": 248_023.19,
+                    "sh_deal_amt_wan": 117_452.13,
+                    "sz_deal_amt_wan": 130_571.06,
+                    "net_buy_wan": None,
+                    "net_buy_status": "unavailable",
                 },
                 "southbound": {
-                    "day_net_wan": -8_000.0,
+                    "net_buy_wan": 51_288.69,
+                    "net_buy_status": "ok",
+                    "sh_net_buy_wan": 64_573.86,
+                    "sz_net_buy_wan": -13_285.17,
                 },
+                "usable_for_style": False,
                 "unit": "万元",
+                "note": "mock：北向仅成交额；净买入不可用时 usable_for_style=false",
                 "source": "mock",
             }
 
-        query = urllib.parse.urlencode(
-            {
-                "fields1": "f1,f2,f3,f4",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-                "ut": "b2884a393a59ad64002292a3e90d46a5",
-            }
-        )
-        payload = self._http_json(self._eastmoney_urls("/api/qt/kamt/get", query))
-        data = (payload or {}).get("data") or {}
-        if not data:
-            raise MarketDataError("hsgt kamt empty")
+        degraded: list[dict[str, str]] = []
+        as_of: str | None = None
+        north: dict[str, Any] = {
+            "deal_amt_wan": None,
+            "sh_deal_amt_wan": None,
+            "sz_deal_amt_wan": None,
+            "net_buy_wan": None,
+            "net_buy_status": "unavailable",
+        }
+        south: dict[str, Any] = {
+            "net_buy_wan": None,
+            "net_buy_status": "unavailable",
+        }
 
-        def _leg(key: str) -> dict[str, Any]:
-            row = data.get(key) or {}
-            return {
-                "status": row.get("status"),
-                "day_net_wan": self._num_or_none(row.get("dayNetAmtIn")),
-                "day_remain_wan": self._num_or_none(row.get("dayAmtRemain")),
-                "day_quota_wan": self._num_or_none(row.get("dayAmtThreshold")),
-                "month_net_wan": self._num_or_none(row.get("monthNetAmtIn")),
-                "buy_wan": self._num_or_none(row.get("buyAmt")),
-                "sell_wan": self._num_or_none(row.get("sellAmt")),
-                "date": row.get("date2") or row.get("date"),
-            }
+        try:
+            rows = self._eastmoney_datacenter("RPT_MUTUAL_DEALAMT", page_size=3)
+            if not rows:
+                raise MarketDataError("RPT_MUTUAL_DEALAMT empty")
+            latest = rows[0]
+            as_of = str(latest.get("TRADE_DATE") or "")[:10] or None
+            north["deal_amt_wan"] = self._num_or_none(latest.get("NF_DEAL_AMT"))
+            north["sh_deal_amt_wan"] = self._num_or_none(latest.get("SSC_DEAL_AMT"))
+            north["sz_deal_amt_wan"] = self._num_or_none(latest.get("ST_DEAL_AMT"))
+            north["lead_stock"] = latest.get("NF_LEAD_STOCKS")
+            north["quota_text"] = latest.get("NF_QUOTA_BALANCE")
+        except Exception as exc:  # noqa: BLE001
+            degraded.append({"section": "deal_amt", "error": str(exc)[:300]})
 
-        hk2sh = _leg("hk2sh")
-        hk2sz = _leg("hk2sz")
-        sh2hk = _leg("sh2hk")
-        sz2hk = _leg("sz2hk")
-        north = (hk2sh.get("day_net_wan") or 0.0) + (hk2sz.get("day_net_wan") or 0.0)
-        south = (sh2hk.get("day_net_wan") or 0.0) + (sz2hk.get("day_net_wan") or 0.0)
+        try:
+            query = urllib.parse.urlencode(
+                {
+                    "fields1": "f1,f2,f3,f4",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+                    "ut": "b2884a393a59ad64002292a3e90d46a5",
+                }
+            )
+            payload = self._http_json(self._eastmoney_urls("/api/qt/kamt/get", query))
+            data = (payload or {}).get("data") or {}
+            # 北向：仅当买卖成交可核对才采信 netBuyAmt；否则保持 unavailable（勿用 dayNetAmtIn/额度）
+            for key, side in (("hk2sh", "sh"), ("hk2sz", "sz")):
+                row = data.get(key) or {}
+                buy = self._num_or_none(row.get("buyAmt"))
+                sell = self._num_or_none(row.get("sellAmt"))
+                net = self._num_or_none(row.get("netBuyAmt"))
+                if self._net_buy_usable(buy, sell, net):
+                    north[f"{side}_net_buy_wan"] = net
+            sh_n = north.get("sh_net_buy_wan")
+            sz_n = north.get("sz_net_buy_wan")
+            if sh_n is not None or sz_n is not None:
+                north["net_buy_wan"] = round((sh_n or 0.0) + (sz_n or 0.0), 2)
+                north["net_buy_status"] = "ok"
+            else:
+                north["net_buy_status"] = "unavailable"
+                degraded.append(
+                    {
+                        "section": "northbound_net_buy",
+                        "error": "kamt 北向买卖/净买入不可核对（监管披露后常为 0 或额度字段），不返回伪净流入",
+                    }
+                )
+
+            # 南向：仍有买卖成交，可核对则返回
+            south_parts: list[float] = []
+            for key, side in (("sh2hk", "sh"), ("sz2hk", "sz")):
+                row = data.get(key) or {}
+                buy = self._num_or_none(row.get("buyAmt"))
+                sell = self._num_or_none(row.get("sellAmt"))
+                net = self._num_or_none(row.get("netBuyAmt"))
+                if self._net_buy_usable(buy, sell, net):
+                    south[f"{side}_net_buy_wan"] = net
+                    south_parts.append(float(net))
+                    if not as_of:
+                        as_of = row.get("date2") or row.get("date")
+            if south_parts:
+                south["net_buy_wan"] = round(sum(south_parts), 2)
+                south["net_buy_status"] = "ok"
+            else:
+                south["net_buy_status"] = "unavailable"
+                degraded.append(
+                    {
+                        "section": "southbound_net_buy",
+                        "error": "kamt 南向净买入不可核对",
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            degraded.append({"section": "kamt", "error": str(exc)[:300]})
+
+        if north.get("deal_amt_wan") is None and north.get("net_buy_wan") is None and south.get(
+            "net_buy_wan"
+        ) is None:
+            raise MarketDataError("hsgt flow empty: " + str(degraded))
+
+        usable = north.get("net_buy_status") == "ok"
         return {
-            "as_of": hk2sh.get("date") or sh2hk.get("date"),
-            "northbound": {
-                "day_net_wan": round(north, 2),
-                "hk2sh": hk2sh,
-                "hk2sz": hk2sz,
-            },
-            "southbound": {
-                "day_net_wan": round(south, 2),
-                "sh2hk": sh2hk,
-                "sz2hk": sz2hk,
-            },
+            "as_of": as_of,
+            "northbound": north,
+            "southbound": south,
+            "usable_for_style": usable,
             "unit": "万元",
-            "note": "day_net_wan>0 为净流入；休市或额度用尽时可能为 0",
-            "source": "eastmoney kamt",
+            "degraded": degraded,
+            "note": (
+                "northbound.deal_amt_wan 为北向成交额（非净买入）。"
+                "net_buy_status=unavailable 时不可用 day_net/额度字段做风格验证。"
+                "usable_for_style 仅在北向净买入可核对时为 true。"
+            ),
+            "source": "eastmoney RPT_MUTUAL_DEALAMT + kamt(netBuyAmt checked)",
+        }
+
+    def get_etf_premium(self, codes: list[str]) -> dict[str, Any]:
+        """ETF 市价相对净值溢折价（东财 FundMNFInfo 真源）。
+
+        份额变动/净申赎若无同源字段则标 unavailable，不编造。
+        """
+        codes = ["".join(ch for ch in str(c) if ch.isdigit())[-6:] for c in codes]
+        codes = [c for c in codes if len(c) == 6][:12]
+        if not codes:
+            raise MarketDataError("codes required")
+        if self.mode == "mock":
+            items = []
+            for code in codes:
+                snap = self._mock_quote(code)
+                nav = round(float(snap["price"]) * 0.995, 4)
+                price = float(snap["price"])
+                items.append(
+                    {
+                        "code": code,
+                        "name": snap["name"],
+                        "price": price,
+                        "nav": nav,
+                        "nav_date": date.today().isoformat(),
+                        "premium_pct": round((price - nav) / nav * 100, 3),
+                        "iopv": None,
+                        "iopv_status": "unavailable",
+                        "share_change_status": "unavailable",
+                        "quote_time": datetime.now().isoformat(timespec="seconds"),
+                    }
+                )
+            return {"count": len(items), "items": items, "source": "mock"}
+
+        url = (
+            "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo?"
+            + urllib.parse.urlencode(
+                {
+                    "pageIndex": "1",
+                    "pageSize": str(len(codes)),
+                    "deviceid": "Wap",
+                    "plat": "Wap",
+                    "product": "EFund",
+                    "Version": "2.0.0",
+                    "Fcodes": ",".join(codes),
+                }
+            )
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://fund.eastmoney.com/",
+            },
+        )
+        with opener.open(req, timeout=12) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        rows = (payload or {}).get("Datas") or []
+        by_code = {str(r.get("FCODE") or "").zfill(6): r for r in rows if isinstance(r, dict)}
+        items: list[dict[str, Any]] = []
+        missing: list[str] = []
+        for code in codes:
+            row = by_code.get(code)
+            if not row:
+                missing.append(code)
+                continue
+            nav = self._num_or_none(row.get("NAV"))
+            price = self._num_or_none(row.get("NEWPRICE"))
+            iopv = self._num_or_none(row.get("GSZ"))
+            premium = None
+            if nav not in (None, 0) and price is not None:
+                premium = round((price - nav) / nav * 100.0, 3)
+            items.append(
+                {
+                    "code": code,
+                    "name": row.get("SHORTNAME") or code,
+                    "price": price,
+                    "nav": nav,
+                    "nav_date": row.get("PDATE"),
+                    "premium_pct": premium,
+                    "iopv": iopv,
+                    "iopv_status": "ok" if iopv is not None else "unavailable",
+                    "share_change_status": "unavailable",
+                    "quote_time": row.get("HQDATE"),
+                    "change_pct": self._num_or_none(row.get("CHANGERATIO")),
+                }
+            )
+        if not items:
+            raise MarketDataError(f"etf premium empty for {codes}")
+        return {
+            "count": len(items),
+            "items": items,
+            "missing": missing,
+            "note": (
+                "premium_pct=(市价-净值)/净值*100；净值为最新已披露日。"
+                "份额变动/净申赎无免费同源时 share_change_status=unavailable。"
+            ),
+            "source": "eastmoney FundMNFInfo",
         }
 
     def _batch_quotes(
@@ -1531,12 +1923,21 @@ class MarketDataProvider:
                 rows = news_mod.fetch_cninfo_announcements(
                     code, limit=per, max_chars=max_chars
                 )
+                if not rows:
+                    degraded.append(
+                        {
+                            "section": f"cninfo:{code}",
+                            "error": "巨潮无 orgId 映射或无公告（沪市部分 ETF 常见），未编造结果",
+                        }
+                    )
                 items.extend(r for r in rows if (r.get("date") or "") >= cutoff)
             except Exception as exc:  # noqa: BLE001
                 degraded.append({"section": f"cninfo:{code}", "error": str(exc)[:300]})
 
         items = sorted(items, key=lambda r: r.get("date") or "", reverse=True)[:limit]
-        if not items and degraded:
+        if not items and degraded and not any(
+            d.get("error", "").startswith("巨潮无 orgId") for d in degraded
+        ):
             raise MarketDataError("announcements empty: " + str(degraded))
         return {
             "codes": codes,
@@ -1545,6 +1946,7 @@ class MarketDataProvider:
             "items": items,
             "degraded": degraded,
             "source": "cninfo",
+            "note": "无映射/无公告时 items 可为空并写入 degraded，不会返回假公告",
         }
 
     def get_macro_digest(

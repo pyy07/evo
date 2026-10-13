@@ -243,29 +243,28 @@ def fetch_eastmoney_stock_news(
     return rows
 
 
-def _cninfo_orgid(code: str) -> str:
+def _cninfo_orgid(code: str) -> str | None:
+    """解析巨潮 orgId；找不到时返回 None（勿用启发式伪 orgId 导致 ETF 空结果被静默吃掉）。"""
     global _CNINFO_ORGID_MAP
     code = "".join(ch for ch in code if ch.isdigit())[-6:]
     if not _CNINFO_ORGID_MAP:
-        try:
-            raw, _ = _request(
-                "http://www.cninfo.com.cn/new/data/szse_stock.json",
-                timeout=15,
-            )
-            stock_list = json.loads(raw.decode("utf-8", "replace")).get("stockList") or []
-            _CNINFO_ORGID_MAP = {
-                s["code"]: s["orgId"] for s in stock_list if s.get("code") and s.get("orgId")
-            }
-        except Exception:  # noqa: BLE001
-            _CNINFO_ORGID_MAP = {}
-    if code in _CNINFO_ORGID_MAP:
-        return _CNINFO_ORGID_MAP[code]
-    # fallback prefix heuristic
-    if code.startswith(("5", "6", "9")):
-        prefix = "sh"
-    else:
-        prefix = "sz"
-    return f"gs{prefix}0{code}"
+        mapping: dict[str, str] = {}
+        for url in (
+            "http://www.cninfo.com.cn/new/data/szse_stock.json",
+            "http://www.cninfo.com.cn/new/data/fund_stock.json",
+        ):
+            try:
+                raw, _ = _request(url, timeout=15)
+                stock_list = json.loads(raw.decode("utf-8", "replace")).get("stockList") or []
+                for s in stock_list:
+                    c = str(s.get("code") or "").zfill(6)
+                    oid = s.get("orgId")
+                    if c and oid and c not in mapping:
+                        mapping[c] = str(oid)
+            except Exception:  # noqa: BLE001
+                continue
+        _CNINFO_ORGID_MAP = mapping
+    return _CNINFO_ORGID_MAP.get(code)
 
 
 def fetch_cninfo_announcements(
@@ -276,6 +275,9 @@ def fetch_cninfo_announcements(
         raise NewsFetchError(f"无效代码: {code}")
     limit = max(1, min(int(limit), 50))
     org_id = _cninfo_orgid(code)
+    if not org_id:
+        # 沪市部分 ETF 不在巨潮 fund_stock 映射里；返回空列表由上层标 degraded，不造假公告
+        return []
     raw, _ = _request(
         "https://www.cninfo.com.cn/new/hisAnnouncement/query",
         method="POST",

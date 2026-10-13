@@ -26,6 +26,7 @@ POSTCLOSE_CAPABILITY_TOOLS = frozenset(
         "get_industry_ranking",
         "get_board_fund_flow",
         "get_hsgt_flow",
+        "get_etf_premium",
         "get_market_news",
         "get_announcements",
         "get_macro_digest",

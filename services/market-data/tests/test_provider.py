@@ -129,13 +129,21 @@ def test_mock_index_valuation_and_breadth():
     assert val["pb"] is None  # 中证估值文件不含 PB
     assert val["pb_status"] == "unavailable"
     assert val["pe_percentile_1y"] is None
+    assert val["pe_percentile_window_start"]
+    assert val["pe_percentile_window_end"]
     breadth = p.get_market_breadth()
     assert breadth["up"] > 0
     assert any(x["label"] == "涨停" for x in breadth["histogram"])
     hsgt = p.get_hsgt_flow()
-    assert hsgt["northbound"]["day_net_wan"] != 0
+    assert hsgt["northbound"]["deal_amt_wan"] is not None
+    assert hsgt["northbound"]["net_buy_status"] == "unavailable"
+    assert hsgt["usable_for_style"] is False
     assert "510050" in {m["code"] for m in p.list_universe(stock_type="etf")}
     assert "512890" in {m["code"] for m in p.list_universe(stock_type="etf")}
+    premium = p.get_etf_premium(["510300", "510050"])
+    assert premium["count"] == 2
+    assert premium["items"][0]["premium_pct"] is not None
+    assert premium["items"][0]["share_change_status"] == "unavailable"
 
 
 def test_overview_filters_concept_noise_and_compacts():
@@ -149,8 +157,18 @@ def test_overview_filters_concept_noise_and_compacts():
                 {"rank": 2, "code": "BK1645", "name": "昨日打二板以上表现", "change_pct": 3.0},
                 {"rank": 3, "code": "BK1675", "name": "历史新高", "change_pct": 2.5},
             ],
-            "bottom": [{"rank": 99, "code": "BK1050", "name": "昨日涨停_含一字", "change_pct": -1}],
-            "total": 3,
+            "bottom": [
+                {"rank": 99, "code": "BK1050", "name": "昨日涨停_含一字", "change_pct": -1},
+                {"rank": 98, "code": "BK1750", "name": "2026中报扭亏", "change_pct": -1.2},
+            ],
+            "total": 5,
+            "filtered_noise": [
+                {"code": "BK1645", "name": "昨日打二板以上表现", "side": "top"},
+                {"code": "BK1675", "name": "历史新高", "side": "top"},
+                {"code": "BK1050", "name": "昨日涨停_含一字", "side": "bottom"},
+                {"code": "BK1750", "name": "2026中报扭亏", "side": "bottom"},
+            ],
+            "filtered_noise_count": 4,
         }
 
     p.industry_comparison = (  # type: ignore[method-assign]
@@ -158,9 +176,13 @@ def test_overview_filters_concept_noise_and_compacts():
         if kwargs.get("board") == "concept"
         else {
             "board": "industry",
-            "top": [{"rank": 1, "code": "BK01", "name": "银行", "change_pct": 1}],
+            "top": [
+                {"rank": 1, "code": "BK01", "name": "焦炭II", "change_pct": 2},
+                {"rank": 2, "code": "BK02", "name": "焦炭III", "change_pct": 1.5},
+                {"rank": 3, "code": "BK03", "name": "银行", "change_pct": 1},
+            ],
             "bottom": [],
-            "total": 1,
+            "total": 3,
         }
     )
     overview = p.get_market_overview(top_n=3)
@@ -169,7 +191,53 @@ def test_overview_filters_concept_noise_and_compacts():
     assert all("涨停" not in n and "新高" not in n and "打二板" not in n for n in hot_names)
     assert overview["concept"]["filtered_noise_count"] >= 1
     assert "hsgt" in overview
+    leaders = [x["name"] for x in overview["industry"]["leaders"]]
+    assert "焦炭II" in leaders
+    assert "焦炭III" not in leaders
+    assert overview["industry_fund_flow"]["top_n"] <= 4
     assert "main_net" in (overview["industry_fund_flow"]["inflow"][0] or {})
+
+
+def test_dedupe_prefers_primary_over_ii_iii():
+    from market_data.provider import _dedupe_board_rows
+
+    rows = _dedupe_board_rows(
+        [
+            {"code": "BK1382", "name": "地面兵装Ⅲ", "change_pct": 1.2},
+            {"code": "BK1229", "name": "地面兵装Ⅱ", "change_pct": 1.2},
+            {"code": "BK01", "name": "银行", "change_pct": 0.5},
+        ]
+    )
+    names = [r["name"] for r in rows]
+    assert "地面兵装Ⅱ" in names
+    assert "地面兵装Ⅲ" not in names
+    assert "银行" in names
+
+
+def test_mock_industry_bottom_is_weakest_first():
+    p = MarketDataProvider(mode="mock")
+    rank = p.industry_comparison(top_n=3, board="industry")
+    assert rank["bottom_order"] == "weakest_first"
+    assert rank["bottom"][0]["change_pct"] <= rank["bottom"][-1]["change_pct"]
+    flow = p.board_fund_flow(board_type="industry", period="today", top_n=3)
+    assert flow["outflow"]
+    assert flow.get("outflow_basis") in ("main_net_negative", "least_inflow") or flow["outflow"][0][
+        "main_net"
+    ] < 0
+
+
+def test_concept_noise_covers_report_labels():
+    from market_data.provider import _is_concept_noise
+
+    assert _is_concept_noise({"code": "BK1199", "name": "2025三季报预减"})
+    assert _is_concept_noise({"code": "BK1750", "name": "2026中报扭亏"})
+    assert not _is_concept_noise({"code": "BK0481", "name": "半导体"})
+
+
+def test_hsgt_rejects_quota_as_net_buy():
+    assert MarketDataProvider._net_buy_usable(0.0, 0.0, 0.0) is False
+    assert MarketDataProvider._net_buy_usable(100.0, 40.0, 60.0) is True
+    assert MarketDataProvider._net_buy_usable(100.0, 40.0, 10.0) is False
 
 
 def test_num_or_none_cleans_eastmoney_dashes():
