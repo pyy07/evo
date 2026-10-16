@@ -86,6 +86,76 @@ def _dedupe_board_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]
     return [best[k][1] for k in order]
 
 
+# 东财行业榜常见「一级→子板块」别名（子名无法用前缀规则推断时）
+_BOARD_CHILD_OF: dict[str, str] = {
+    "半导体": "电子",
+    "消费电子": "电子",
+    "元件": "电子",
+    "光学光电子": "电子",
+    "其他电子": "电子",
+    "通信设备": "通信",
+    "通信网络设备及器件": "通信",
+    "通信服务": "通信",
+    "动力煤": "煤炭",
+    "煤炭开采": "煤炭",
+    "焦炭": "煤炭",
+    "数字媒体": "传媒",
+    "视频媒体": "传媒",
+    "文字媒体": "传媒",
+    "广告营销": "传媒",
+    "电视广播": "传媒",
+    "锂电池": "电池",
+    "光伏设备": "电力设备",
+    "风电设备": "电力设备",
+    "电池": "电力设备",
+}
+
+
+def _is_board_child_of(child: str, parent: str) -> bool:
+    c = _board_base_name(child)
+    p = _board_base_name(parent)
+    if not c or not p or c == p:
+        return False
+    if _BOARD_CHILD_OF.get(c) == p:
+        return True
+    # 煤炭开采 / 股份制银行：父名是子名的真前缀或真子串
+    if len(p) >= 2 and c.startswith(p) and len(c) > len(p):
+        return True
+    if len(p) >= 2 and p in c and len(c) > len(p) and not c.startswith(p):
+        # 避免过短误伤：要求父名至少 2 字且为完整词片段
+        return True
+    return False
+
+
+def _dedupe_parent_child_boards(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """父子板块并存时保留父级（更短/一级），剔除子板块重复计数。"""
+    rows = list(rows or [])
+    drop: set[int] = set()
+    for i, a in enumerate(rows):
+        if i in drop:
+            continue
+        na = str(a.get("name") or "")
+        for j, b in enumerate(rows):
+            if i == j or j in drop:
+                continue
+            nb = str(b.get("name") or "")
+            if _is_board_child_of(nb, na):
+                drop.add(j)
+            elif _is_board_child_of(na, nb):
+                drop.add(i)
+                break
+    return [r for i, r in enumerate(rows) if i not in drop]
+
+
+def _member_count(row: dict[str, Any]) -> int:
+    try:
+        up = int(row.get("up_count") or 0)
+        down = int(row.get("down_count") or 0)
+        return max(0, up + down)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _compact_board_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """概览里只保留必要字段，避免 tool 输出被 6k 截断后丢掉资金流尾部。"""
     out: list[dict[str, Any]] = []
@@ -337,6 +407,30 @@ _EM_HOSTS = (
 _EM_HOSTS = (
     "https://push2.eastmoney.com",
     "https://push2delay.eastmoney.com",
+)
+
+# 国家队代理：历史上常被汇金/证金/社保披露持有的宽基 ETF（非实时归因名单）
+_NT_SEED_ETFS: list[dict[str, str]] = [
+    {"code": "510050", "name": "上证50ETF"},
+    {"code": "510300", "name": "沪深300ETF华泰柏瑞"},
+    {"code": "510310", "name": "沪深300ETF易方达"},
+    {"code": "510500", "name": "中证500ETF"},
+    {"code": "159919", "name": "沪深300ETF华夏"},
+    {"code": "159922", "name": "中证500ETF嘉实"},
+    {"code": "588000", "name": "科创50ETF"},
+    {"code": "512100", "name": "中证1000ETF"},
+]
+
+_NT_HOLDER_KEYWORDS = (
+    "中央汇金",
+    "汇金资管",
+    "汇金投资",
+    "中国证券金融",
+    "证金",
+    "全国社保",
+    "社保基金",
+    "基本养老",
+    "社保",
 )
 
 
@@ -728,34 +822,59 @@ class MarketDataProvider:
             raise MarketDataError("sina industry empty")
         return rows
 
-    def _sina_industry_comparison(self, *, top_n: int, board: str) -> dict[str, Any]:
-        rows = _dedupe_board_rows(self._sina_hy_boards())
-        ranked = [
-            {
-                "rank": i + 1,
+    def _sina_industry_comparison(
+        self, *, top_n: int, board: str, min_member_count: int = 3
+    ) -> dict[str, Any]:
+        rows = _dedupe_parent_child_boards(_dedupe_board_rows(self._sina_hy_boards()))
+        ranked = []
+        low_excluded: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                mc = int(float(r.get("count") or 0))
+            except (TypeError, ValueError):
+                mc = 0
+            item = {
                 "name": r["name"],
                 "code": r["code"],
                 "change_pct": r.get("change_pct") or 0,
                 "up_count": 0,
                 "down_count": 0,
+                "member_count": mc,
+                "low_sample": mc > 0 and mc < min_member_count,
                 "leader": r.get("leader") or "",
                 "leader_change": 0,
             }
-            for i, r in enumerate(rows)
-        ]
-        laggards = list(reversed(ranked[-top_n:])) if ranked else []
-        for i, row in enumerate(laggards):
-            row = dict(row)
-            row["rank"] = i + 1
-            laggards[i] = row
+            if item["low_sample"]:
+                low_excluded.append(item)
+            else:
+                ranked.append(item)
+        if len(ranked) < top_n:
+            ranked.extend(low_excluded[: top_n - len(ranked)])
+        top = [{**r, "rank": i + 1} for i, r in enumerate(ranked[:top_n])]
+        all_sorted = sorted(
+            ranked + [x for x in low_excluded if x not in ranked],
+            key=lambda x: float(x.get("change_pct") or 0),
+        )
+        # weakest first from full set after filter preference
+        weak_pool = [r for r in all_sorted if not r.get("low_sample")] or all_sorted
+        laggards = [{**r, "rank": i + 1} for i, r in enumerate(weak_pool[:top_n])]
         return {
             "board": board,
-            "top": ranked[:top_n],
+            "top": top,
             "bottom": laggards,
-            "total": len(ranked),
+            "total": len(ranked) + len(low_excluded),
+            "universe_size": len(rows),
+            "min_member_count": min_member_count,
+            "low_sample_excluded_top": [
+                {"code": r.get("code"), "name": r.get("name"), "member_count": r.get("member_count")}
+                for r in low_excluded
+            ],
             "sort": "change_pct",
             "bottom_order": "weakest_first",
-            "universe_note": "新浪行业全样本；bottom 为涨跌幅升序最弱端",
+            "universe_note": (
+                f"新浪行业全样本；主榜优先 member_count>={min_member_count}；"
+                "bottom 为涨跌幅最弱端"
+            ),
             "source": "sina newSinaHy (eastmoney clist fallback)",
         }
 
@@ -791,9 +910,16 @@ class MarketDataProvider:
             "source": "sina newSinaHy",
         }
 
-    def industry_comparison(self, *, top_n: int = 10, board: str = "industry") -> dict[str, Any]:
+    def industry_comparison(
+        self,
+        *,
+        top_n: int = 10,
+        board: str = "industry",
+        min_member_count: int = 3,
+    ) -> dict[str, Any]:
         """行业/概念涨跌排名（a-stock-data §3.7 industry_comparison 同源）。"""
         top_n = max(3, min(int(top_n), 30))
+        min_member_count = max(1, min(int(min_member_count), 50))
         fs = {"industry": "m:90+t:2", "concept": "m:90+t:3"}.get(board)
         if not fs:
             raise MarketDataError(f"board 须为 industry|concept，收到 {board!r}")
@@ -806,6 +932,8 @@ class MarketDataProvider:
                     "change_pct": pct,
                     "up_count": 40 + i,
                     "down_count": 20 - i // 2,
+                    "member_count": 60 + i,
+                    "low_sample": False,
                     "leader": leader,
                     "leader_change": pct + 5,
                 }
@@ -827,6 +955,8 @@ class MarketDataProvider:
                 "top": rows[:top_n],
                 "bottom": bottom,
                 "total": len(rows),
+                "universe_size": len(rows),
+                "min_member_count": min_member_count,
                 "sort": "change_pct",
                 "bottom_order": "weakest_first",
                 "universe_note": "mock 全样本；bottom 为涨跌幅最弱端",
@@ -841,9 +971,15 @@ class MarketDataProvider:
                 fs=fs, page=1, page_size=100, fields=fields, fid="f3", po="0"
             )
         except Exception:
-            return self._sina_industry_comparison(top_n=top_n, board=board)
-        top_rows = _dedupe_board_rows(self._map_board_rank_rows(strong))
-        bottom_rows = _dedupe_board_rows(self._map_board_rank_rows(weak))
+            return self._sina_industry_comparison(
+                top_n=top_n, board=board, min_member_count=min_member_count
+            )
+        top_rows = _dedupe_parent_child_boards(
+            _dedupe_board_rows(self._map_board_rank_rows(strong))
+        )
+        bottom_rows = _dedupe_parent_child_boards(
+            _dedupe_board_rows(self._map_board_rank_rows(weak))
+        )
         filtered_noise: list[dict[str, Any]] = []
         if board == "concept":
             kept_top: list[dict[str, Any]] = []
@@ -859,18 +995,47 @@ class MarketDataProvider:
                 else:
                     kept_bottom.append(r)
             top_rows, bottom_rows = kept_top, kept_bottom
-        top = [{**r, "rank": i + 1} for i, r in enumerate(top_rows[:top_n])]
-        bottom = [{**r, "rank": i + 1} for i, r in enumerate(bottom_rows[:top_n])]
+
+        def _annotate(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            kept: list[dict[str, Any]] = []
+            low: list[dict[str, Any]] = []
+            for r in rows:
+                mc = _member_count(r)
+                item = {**r, "member_count": mc, "low_sample": mc < min_member_count}
+                if item["low_sample"]:
+                    low.append(item)
+                else:
+                    kept.append(item)
+            return kept, low
+
+        top_kept, top_low = _annotate(top_rows)
+        bottom_kept, bottom_low = _annotate(bottom_rows)
+        # 主榜优先够样本；不足时用 low_sample 补齐并保留标注
+        def _fill(kept: list[dict[str, Any]], low: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            out = list(kept)
+            if len(out) < top_n:
+                out.extend(low[: top_n - len(out)])
+            return [{**r, "rank": i + 1} for i, r in enumerate(out[:top_n])]
+
+        top = _fill(top_kept, top_low)
+        bottom = _fill(bottom_kept, bottom_low)
         result: dict[str, Any] = {
             "board": board,
             "top": top,
             "bottom": bottom,
-            "total": max(len(top_rows), len(bottom_rows)),
+            "total": max(len(top_kept) + len(top_low), len(bottom_kept) + len(bottom_low)),
+            "universe_size": max(len(top_rows), len(bottom_rows)),
+            "min_member_count": min_member_count,
+            "low_sample_excluded_top": [
+                {"code": r.get("code"), "name": r.get("name"), "member_count": r.get("member_count")}
+                for r in top_low
+            ],
             "sort": "change_pct",
             "bottom_order": "weakest_first",
             "universe_note": (
                 "东财行业/概念板块榜按涨跌幅两端取样（非前100强尾部）；"
-                "已按主层级去重（同名优先保留无Ⅱ/Ⅲ后缀）"
+                "已按主层级/父子板块去重；"
+                f"主榜优先 member_count>={min_member_count}（up+down），不足则带 low_sample=true 回填"
                 + ("；概念已过滤交易/财报统计标签" if board == "concept" else "")
             ),
             "source": "eastmoney clist",
@@ -968,7 +1133,7 @@ class MarketDataProvider:
                         }
                     )
                 mapped.append(row)
-            return _dedupe_board_rows(mapped)
+            return _dedupe_parent_child_boards(_dedupe_board_rows(mapped))
 
         try:
             inflow_items = self._eastmoney_clist(
@@ -1020,7 +1185,7 @@ class MarketDataProvider:
             "inflow": inflow,
             "outflow": outflow,
             "outflow_basis": outflow_basis,
-            "note": outflow_note + "；已按主层级去重",
+            "note": outflow_note + "；已按Ⅱ/Ⅲ与父子板块去重（保留一级）",
             "source": "eastmoney clist",
         }
 
@@ -1073,18 +1238,22 @@ class MarketDataProvider:
         labels = {
             "000001": "上证指数",
             "399001": "深证成指",
+            "000015": "红利指数",
             "000016": "上证50",
             "000300": "沪深300",
             "399006": "创业板指",
             "000905": "中证500",
             "000852": "中证1000",
             "000688": "科创50",
+            "399303": "国证2000",
+            "000922": "中证红利",
         }
+        mapped_name = labels.get(index_code) or labels.get(raw) or index_code
         if self.mode == "mock":
             return {
                 "code": raw,
                 "index_code": index_code,
-                "name": labels.get(index_code, index_code),
+                "name": mapped_name,
                 "pe": 12.8,
                 "pe_ttm": 12.8,
                 "pb": None,
@@ -1099,6 +1268,7 @@ class MarketDataProvider:
                 "pb_status": "unavailable",
                 "dividend_yield_percent": 2.5,
                 "as_of": date.today().isoformat(),
+                "degraded": False,
                 "note": (
                     "ETF 快照 pe_ttm/pb 常为 0/-，请用本能力。"
                     "PB 中证未提供；pe_percentile 仅为中证近期文件窗口分位，非 1年/3年/全历史。"
@@ -1108,7 +1278,7 @@ class MarketDataProvider:
         out: dict[str, Any] = {
             "code": raw,
             "index_code": index_code,
-            "name": labels.get(index_code, index_code),
+            "name": mapped_name,
             "pe": None,
             "pe_ttm": None,
             "pb": None,
@@ -1122,11 +1292,13 @@ class MarketDataProvider:
             "pe_percentile_3y": None,
             "dividend_yield_percent": None,
             "as_of": None,
+            "degraded": False,
             "note": (
                 "ETF/指数快照 pe_ttm、pb 常为 0 或 '-'；"
                 "PE 与股息率来自中证近期估值文件。"
                 "pb_status=unavailable（中证 indicator.xls 无 PB）；"
                 "pe_percentile 仅为该文件近期窗口分位，1y/3y 全历史分位暂无同源数据。"
+                "name 优先本地映射，东财 ulist 仅作补充；ulist 失败标 degraded，不把代码当名称。"
             ),
             "source": None,
         }
@@ -1137,7 +1309,12 @@ class MarketDataProvider:
             )
             if rows:
                 row = rows[0]
-                out["name"] = row.get("f14") or out["name"]
+                em_name = str(row.get("f14") or "").strip()
+                # 仅当本地无映射时才采用东财名称，避免失败路径污染
+                if em_name and index_code not in labels and raw not in labels:
+                    out["name"] = em_name
+                elif em_name and out["name"] == index_code:
+                    out["name"] = em_name
                 pe = self._num_or_none(row.get("f9"))
                 pe_ttm = self._num_or_none(row.get("f115")) or pe
                 pb = self._num_or_none(row.get("f23"))
@@ -1150,6 +1327,9 @@ class MarketDataProvider:
                 out["source"] = "eastmoney_ulist"
         except Exception as exc:  # noqa: BLE001
             out["ulist_error"] = str(exc)[:300]
+            out["degraded"] = True
+            out["ulist_status"] = "unavailable"
+            # 保持 mapped_name，绝不回退成裸代码误导下游
         try:
             from market_data import asd_core
 
@@ -1609,36 +1789,186 @@ class MarketDataProvider:
             "source": "eastmoney RPT_MUTUAL_DEALAMT + kamt(netBuyAmt checked)",
         }
 
-    def get_etf_premium(self, codes: list[str]) -> dict[str, Any]:
-        """ETF 市价相对净值溢折价（东财 FundMNFInfo 真源）。
+    def _attach_share_flow_fields(
+        self,
+        item: dict[str, Any],
+        *,
+        share_info: dict[str, Any] | None,
+        share_as_of: str | None,
+        share_prev_as_of: str | None,
+    ) -> None:
+        """就地写入份额增减字段；交易所披露为 T+1，标 t1_only。"""
+        if not share_info or share_info.get("share") is None:
+            item["share_change_status"] = "unavailable"
+            item["share"] = None
+            item["prev_share"] = None
+            item["share_change"] = None
+            item["share_change_pct"] = None
+            item["estimated_net_flow"] = None
+            item["share_as_of"] = share_as_of
+            item["share_prev_as_of"] = share_prev_as_of
+            return
+        share = share_info.get("share")
+        prev_share = share_info.get("prev_share")
+        share_change = share_info.get("share_change")
+        share_change_pct = share_info.get("share_change_pct")
+        nav = item.get("nav")
+        estimated = None
+        if share_change is not None and nav not in (None, 0):
+            estimated = round(float(share_change) * float(nav), 2)
+        item.update(
+            {
+                "share_change_status": "t1_only",
+                "share": share,
+                "prev_share": prev_share,
+                "share_change": share_change,
+                "share_change_pct": share_change_pct,
+                "estimated_net_flow": estimated,
+                "share_as_of": share_as_of,
+                "share_prev_as_of": share_prev_as_of,
+                "share_usable_for_intraday": False,
+            }
+        )
 
-        份额变动/净申赎若无同源字段则标 unavailable，不编造。
+    def _etf_share_flow_bundle(
+        self, codes: list[str], *, lookback_days: int = 12
+    ) -> dict[str, Any]:
+        """批量取交易所 T+1 份额变动；失败时 items 为空但不抛。"""
+        empty = {
+            "as_of": None,
+            "prev_as_of": None,
+            "items": {},
+            "usable_for_intraday": False,
+            "gaps": [],
+        }
+        if self.mode == "mock":
+            items: dict[str, dict[str, Any]] = {}
+            for i, code in enumerate(codes):
+                share = 1_000_000_000.0 + i * 50_000_000.0
+                prev = share * 0.995
+                change = share - prev
+                items[code] = {
+                    "share": share,
+                    "prev_share": prev,
+                    "share_change": change,
+                    "share_change_pct": round(change / prev * 100.0, 4),
+                }
+            today = date.today()
+            return {
+                "as_of": (today - timedelta(days=1)).isoformat(),
+                "prev_as_of": (today - timedelta(days=2)).isoformat(),
+                "items": items,
+                "usable_for_intraday": False,
+                "gaps": [],
+            }
+        try:
+            primary, prev, sse_map = self._resolve_share_dates(
+                as_of=None, lookback_days=lookback_days
+            )
+        except MarketDataError as exc:
+            empty["gaps"].append(str(exc)[:200])
+            return empty
+        prev_map = sse_map.pop("__prev_map__", {}) if sse_map else {}
+        if not isinstance(prev_map, dict):
+            prev_map = {}
+        gaps: list[str] = []
+        if primary is None:
+            gaps.append("无可用交易所份额披露日")
+            empty["gaps"] = gaps
+            return empty
+        out_items: dict[str, dict[str, Any]] = {}
+        for code in codes:
+            exchange = self._etf_exchange(code)
+            cur_row: dict[str, Any] | None = None
+            prev_row: dict[str, Any] | None = None
+            if exchange == "SSE":
+                cur_row = sse_map.get(code)
+                prev_row = prev_map.get(code)
+            else:
+                try:
+                    cur_row = self._szse_etf_share(code, primary)
+                except MarketDataError as exc:
+                    gaps.append(f"{code}: {exc}")
+                if prev is not None:
+                    try:
+                        prev_row = self._szse_etf_share(code, prev)
+                    except MarketDataError as exc:
+                        gaps.append(f"{code} prev: {exc}")
+            if not cur_row or cur_row.get("share") is None:
+                continue
+            share = float(cur_row["share"])
+            prev_share = float(prev_row["share"]) if prev_row and prev_row.get("share") is not None else None
+            share_change = None
+            share_change_pct = None
+            if prev_share not in (None, 0):
+                share_change = share - float(prev_share)
+                share_change_pct = round(share_change / float(prev_share) * 100.0, 4)
+            out_items[code] = {
+                "share": share,
+                "prev_share": prev_share,
+                "share_change": share_change,
+                "share_change_pct": share_change_pct,
+            }
+        return {
+            "as_of": primary.isoformat(),
+            "prev_as_of": prev.isoformat() if prev else None,
+            "items": out_items,
+            "usable_for_intraday": False,
+            "gaps": gaps,
+        }
+
+    def get_etf_premium(self, codes: list[str]) -> dict[str, Any]:
+        """ETF 市价相对净值溢折价（东财 FundMNFInfo）+ 交易所 T+1 份额增减。
+
+        份额为 T+1 披露：share_change_status=t1_only，不可用于盘中当日判断。
         """
         codes = ["".join(ch for ch in str(c) if ch.isdigit())[-6:] for c in codes]
         codes = [c for c in codes if len(c) == 6][:12]
         if not codes:
             raise MarketDataError("codes required")
+        share_bundle = self._etf_share_flow_bundle(codes)
+        share_as_of = share_bundle.get("as_of")
+        share_prev_as_of = share_bundle.get("prev_as_of")
+        share_items = share_bundle.get("items") or {}
         if self.mode == "mock":
             items = []
             for code in codes:
                 snap = self._mock_quote(code)
                 nav = round(float(snap["price"]) * 0.995, 4)
                 price = float(snap["price"])
-                items.append(
-                    {
-                        "code": code,
-                        "name": snap["name"],
-                        "price": price,
-                        "nav": nav,
-                        "nav_date": date.today().isoformat(),
-                        "premium_pct": round((price - nav) / nav * 100, 3),
-                        "iopv": None,
-                        "iopv_status": "unavailable",
-                        "share_change_status": "unavailable",
-                        "quote_time": datetime.now().isoformat(timespec="seconds"),
-                    }
+                iopv = round(float(snap["price"]) * 0.998, 4)
+                item = {
+                    "code": code,
+                    "name": snap["name"],
+                    "price": price,
+                    "nav": nav,
+                    "nav_date": date.today().isoformat(),
+                    "nav_is_stale": False,
+                    "stale_days": 0,
+                    "premium_pct": round((price - iopv) / iopv * 100, 3),
+                    "premium_basis": "iopv",
+                    "stale_adjusted_premium_pct": None,
+                    "iopv": iopv,
+                    "iopv_status": "ok",
+                    "change_pct": snap.get("change_pct"),
+                    "quote_time": datetime.now().isoformat(timespec="seconds"),
+                }
+                self._attach_share_flow_fields(
+                    item,
+                    share_info=share_items.get(code),
+                    share_as_of=share_as_of,
+                    share_prev_as_of=share_prev_as_of,
                 )
-            return {"count": len(items), "items": items, "source": "mock"}
+                items.append(item)
+            return {
+                "count": len(items),
+                "items": items,
+                "share_as_of": share_as_of,
+                "share_prev_as_of": share_prev_as_of,
+                "share_usable_for_intraday": False,
+                "source": "mock",
+                "note": "mock：premium_pct 相对 IOPV；份额为 T+1 代理",
+            }
 
         url = (
             "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo?"
@@ -1666,6 +1996,20 @@ class MarketDataProvider:
             payload = json.loads(resp.read().decode("utf-8"))
         rows = (payload or {}).get("Datas") or []
         by_code = {str(r.get("FCODE") or "").zfill(6): r for r in rows if isinstance(r, dict)}
+        # 东财 GSZ 盘后常空：腾讯行情字段 78≈IOPV 作回退
+        tencent_iopv: dict[str, float] = {}
+        try:
+            from market_data import asd_core
+
+            tq = asd_core.tencent_quote(codes)
+            for code in codes:
+                raw_iopv = (tq.get(code) or {}).get("iopv")
+                num = self._num_or_none(raw_iopv)
+                if num not in (None, 0):
+                    tencent_iopv[code] = float(num)
+        except Exception:  # noqa: BLE001
+            tencent_iopv = {}
+        today = date.today()
         items: list[dict[str, Any]] = []
         missing: list[str] = []
         for code in codes:
@@ -1675,36 +2019,596 @@ class MarketDataProvider:
                 continue
             nav = self._num_or_none(row.get("NAV"))
             price = self._num_or_none(row.get("NEWPRICE"))
+            # GSZ=估算净值/IOPV；盘后常为空 → 回退腾讯 iopv
             iopv = self._num_or_none(row.get("GSZ"))
+            iopv_source = "eastmoney_gsz" if iopv not in (None, 0) else None
+            if iopv in (None, 0) and code in tencent_iopv:
+                iopv = tencent_iopv[code]
+                iopv_source = "tencent_quote"
+            change_pct = self._num_or_none(row.get("CHANGERATIO"))
+            nav_date_raw = row.get("PDATE")
+            nav_day: date | None = None
+            if isinstance(nav_date_raw, str) and len(nav_date_raw) >= 10:
+                try:
+                    nav_day = date.fromisoformat(nav_date_raw[:10])
+                except ValueError:
+                    nav_day = None
+            stale_days = (today - nav_day).days if nav_day else None
+            nav_is_stale = bool(stale_days is not None and stale_days >= 1)
+
             premium = None
-            if nav not in (None, 0) and price is not None:
+            premium_basis = "unavailable"
+            stale_adjusted = None
+            if iopv not in (None, 0) and price is not None:
+                premium = round((price - iopv) / iopv * 100.0, 3)
+                premium_basis = "iopv"
+            elif nav not in (None, 0) and price is not None:
                 premium = round((price - nav) / nav * 100.0, 3)
-            items.append(
-                {
-                    "code": code,
-                    "name": row.get("SHORTNAME") or code,
-                    "price": price,
-                    "nav": nav,
-                    "nav_date": row.get("PDATE"),
-                    "premium_pct": premium,
-                    "iopv": iopv,
-                    "iopv_status": "ok" if iopv is not None else "unavailable",
-                    "share_change_status": "unavailable",
-                    "quote_time": row.get("HQDATE"),
-                    "change_pct": self._num_or_none(row.get("CHANGERATIO")),
-                }
+                premium_basis = "nav_t1"
+                # 隔日净值口径下 premium ≈ 当日涨跌幅反向；剔除滞后后看残差
+                if change_pct is not None:
+                    stale_adjusted = round(premium - change_pct, 3)
+
+            tip = None
+            if premium_basis == "nav_t1":
+                tip = (
+                    "隔日净值口径（nav_is_stale=true）：premium_pct 方向常贴近当日涨跌幅反向，"
+                    "不具当日折溢价参考意义；请看 stale_adjusted_premium_pct 或等 IOPV。"
+                )
+            elif premium_basis == "iopv" and iopv_source == "tencent_quote":
+                tip = "IOPV 来自腾讯行情字段回退（东财 GSZ 为空时常用）。"
+            item = {
+                "code": code,
+                "name": row.get("SHORTNAME") or code,
+                "price": price,
+                "nav": nav,
+                "nav_date": nav_date_raw,
+                "nav_is_stale": nav_is_stale,
+                "stale_days": stale_days,
+                "premium_pct": premium,
+                "premium_basis": premium_basis,
+                "stale_adjusted_premium_pct": stale_adjusted,
+                "iopv": iopv,
+                "iopv_status": "ok" if iopv is not None else "unavailable",
+                "iopv_source": iopv_source,
+                "quote_time": row.get("HQDATE"),
+                "change_pct": change_pct,
+                "tip": tip,
+            }
+            self._attach_share_flow_fields(
+                item,
+                share_info=share_items.get(code),
+                share_as_of=share_as_of,
+                share_prev_as_of=share_prev_as_of,
             )
+            if item.get("share_change_status") == "t1_only":
+                share_tip = (
+                    f"份额为交易所 T+1 披露（as_of={share_as_of}），"
+                    "share_change_status=t1_only，不可当作盘中当日申赎结论。"
+                )
+                item["tip"] = f"{tip} {share_tip}".strip() if tip else share_tip
+            items.append(item)
         if not items:
             raise MarketDataError(f"etf premium empty for {codes}")
         return {
             "count": len(items),
             "items": items,
             "missing": missing,
+            "share_as_of": share_as_of,
+            "share_prev_as_of": share_prev_as_of,
+            "share_usable_for_intraday": False,
+            "share_gaps": share_bundle.get("gaps") or [],
             "note": (
-                "premium_pct=(市价-净值)/净值*100；净值为最新已披露日。"
-                "份额变动/净申赎无免费同源时 share_change_status=unavailable。"
+                "优先 premium_basis=iopv：东财 GSZ，空则回退腾讯行情 IOPV（iopv_source 标明）；"
+                "仍无 IOPV 时用已披露净值（常为 T-1）并标 nav_is_stale，"
+                "stale_adjusted_premium_pct=premium_pct-change_pct 剔除当日涨跌滞后。"
+                "份额来自沪深交易所 T+1 披露：share_change_status=t1_only，"
+                "estimated_net_flow≈份额变动×净值（元），不可用于盘中当日判断。"
             ),
-            "source": "eastmoney FundMNFInfo",
+            "source": "eastmoney FundMNFInfo + tencent IOPV fallback + SSE/SZSE ETF share",
+        }
+
+    @staticmethod
+    def _is_national_team_holder(name: str) -> bool:
+        n = str(name or "")
+        if not n:
+            return False
+        return any(kw in n for kw in _NT_HOLDER_KEYWORDS)
+
+    @staticmethod
+    def _normalize_etf_code(code: Any) -> str:
+        digits = "".join(ch for ch in str(code or "") if ch.isdigit())
+        return digits[-6:] if len(digits) >= 6 else digits
+
+    @staticmethod
+    def _etf_exchange(code: str) -> str:
+        c = str(code or "")
+        if c.startswith(("15", "16", "18")):
+            return "SZSE"
+        return "SSE"
+
+    def _http_json_referer(
+        self,
+        url: str,
+        *,
+        referer: str,
+        timeout: int = 20,
+        retries: int = 2,
+    ) -> Any:
+        last: Exception | None = None
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Referer": referer,
+            "Accept": "application/json,text/plain,*/*",
+        }
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with opener.open(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                time.sleep(0.15 * (attempt + 1))
+        raise MarketDataError(f"http json failed: {last}") from last
+
+    def _sse_etf_shares_by_date(self, stat_date: date) -> dict[str, dict[str, Any]]:
+        """上交所 ETF 份额；TOT_VOL 单位万份 → 份。"""
+        url = "https://query.sse.com.cn/commonQuery.do?" + urllib.parse.urlencode(
+            {
+                "isPagination": "true",
+                "pageHelp.pageSize": "10000",
+                "pageHelp.pageNo": "1",
+                "pageHelp.beginPage": "1",
+                "pageHelp.cacheSize": "1",
+                "pageHelp.endPage": "1",
+                "sqlId": "COMMON_SSE_ZQPZ_ETFZL_XXPL_ETFGM_SEARCH_L",
+                "STAT_DATE": stat_date.isoformat(),
+            }
+        )
+        payload = self._http_json_referer(url, referer="https://www.sse.com.cn/", timeout=30)
+        rows = payload.get("result") if isinstance(payload, dict) else None
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            code = self._normalize_etf_code(row.get("SEC_CODE"))
+            vol = self._num_or_none(row.get("TOT_VOL"))
+            if not code or vol is None:
+                continue
+            out[code] = {
+                "code": code,
+                "name": str(row.get("SEC_NAME") or code),
+                "share": vol * 10_000.0,
+                "stat_date": str(row.get("STAT_DATE") or stat_date.isoformat()),
+                "exchange": "SSE",
+            }
+        return out
+
+    def _szse_etf_share(self, code: str, stat_date: date) -> dict[str, Any] | None:
+        """深交所单只 ETF 份额；current_size 单位万份 → 份。"""
+        url = "https://www.szse.cn/api/report/ShowReport/data?" + urllib.parse.urlencode(
+            {
+                "SHOWTYPE": "JSON",
+                "CATALOGID": "scsj_fund_jjgm",
+                "TABKEY": "tab1",
+                "txtStart": stat_date.isoformat(),
+                "txtEnd": stat_date.isoformat(),
+                "jjlb": "ETF",
+                "txtDm": code,
+                "PAGENO": "1",
+                "PAGESIZE": "5",
+                "random": "0.1",
+            }
+        )
+        payload = self._http_json_referer(
+            url,
+            referer="https://www.szse.cn/market/fund/volume/etf/index.html",
+            timeout=20,
+        )
+        block = payload[0] if isinstance(payload, list) and payload else None
+        rows = (block or {}).get("data") if isinstance(block, dict) else None
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            row_code = self._normalize_etf_code(row.get("fund_code"))
+            if row_code != code:
+                continue
+            raw_size = str(row.get("current_size") or "").replace(",", "")
+            vol = self._num_or_none(raw_size)
+            if vol is None:
+                return None
+            return {
+                "code": code,
+                "name": str(row.get("security_short_name") or code),
+                "share": vol * 10_000.0,
+                "stat_date": str(row.get("size_date") or stat_date.isoformat()),
+                "exchange": "SZSE",
+            }
+        return None
+
+    def _resolve_share_dates(
+        self, *, as_of: date | None, lookback_days: int
+    ) -> tuple[date | None, date | None, dict[str, dict[str, Any]]]:
+        """找最近有上交所份额披露的一日，以及其前一披露日。"""
+        start = as_of or (date.today() - timedelta(days=1))
+        primary: date | None = None
+        primary_map: dict[str, dict[str, Any]] = {}
+        for i in range(max(1, lookback_days)):
+            d = start - timedelta(days=i)
+            try:
+                m = self._sse_etf_shares_by_date(d)
+            except MarketDataError:
+                m = {}
+            if m:
+                primary = d
+                primary_map = m
+                break
+        if primary is None:
+            return None, None, {}
+        prev: date | None = None
+        for i in range(1, max(2, lookback_days + 1)):
+            d = primary - timedelta(days=i)
+            try:
+                m = self._sse_etf_shares_by_date(d)
+            except MarketDataError:
+                m = {}
+            if m:
+                prev = d
+                # stash prev map under a private key for reuse
+                primary_map["__prev_map__"] = m  # type: ignore[assignment]
+                break
+        return primary, prev, primary_map
+
+    def _sina_holder_report_dates(self, code: str) -> list[str]:
+        url = f"https://stock.finance.sina.com.cn/fundInfo/view/FundInfo_JJCYR.php?symbol={code}"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://finance.sina.com.cn/",
+            },
+        )
+        try:
+            with opener.open(req, timeout=15) as resp:
+                text = resp.read().decode("gbk", errors="replace")
+        except Exception:  # noqa: BLE001
+            return []
+        return re.findall(
+            r'<option[^>]*value=["\'](\d{4}-\d{2}-\d{2})["\']',
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    def _sina_fund_holders(self, code: str, report_date: str) -> list[dict[str, Any]]:
+        url = (
+            "https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/"
+            "CaihuiFundInfoService.getFundHolder?"
+            + urllib.parse.urlencode({"symbol": code, "date": report_date})
+        )
+        payload = self._http_json_referer(
+            url,
+            referer=(
+                "https://stock.finance.sina.com.cn/fundInfo/view/"
+                f"FundInfo_JJCYR.php?symbol={code}"
+            ),
+            timeout=15,
+        )
+        rows = ((payload or {}).get("result") or {}).get("data") or []
+        out: list[dict[str, Any]] = []
+        for i, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("cyrmc") or "").strip()
+            if not name:
+                continue
+            amount = self._num_or_none(row.get("cyfe"))
+            ratio = self._num_or_none(row.get("zfeb"))
+            out.append(
+                {
+                    "rank": i + 1,
+                    "name": name,
+                    "hold_amount": amount,
+                    "hold_ratio": ratio,
+                    "is_nt": self._is_national_team_holder(name),
+                }
+            )
+        return out
+
+    def _fetch_nav_map(self, codes: list[str]) -> dict[str, float | None]:
+        if not codes:
+            return {}
+        if self.mode == "mock":
+            return {c: float(self._mock_quote(c)["price"]) * 0.995 for c in codes}
+        url = (
+            "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo?"
+            + urllib.parse.urlencode(
+                {
+                    "pageIndex": "1",
+                    "pageSize": str(len(codes)),
+                    "deviceid": "Wap",
+                    "plat": "Wap",
+                    "product": "EFund",
+                    "Version": "2.0.0",
+                    "Fcodes": ",".join(codes),
+                }
+            )
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://fund.eastmoney.com/"},
+        )
+        try:
+            with opener.open(req, timeout=12) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return {c: None for c in codes}
+        rows = (payload or {}).get("Datas") or []
+        by_code = {str(r.get("FCODE") or "").zfill(6): r for r in rows if isinstance(r, dict)}
+        return {c: self._num_or_none((by_code.get(c) or {}).get("NAV")) for c in codes}
+
+    def get_national_team_flow(
+        self,
+        *,
+        codes: list[str] | None = None,
+        as_of: str | date | None = None,
+        include_holders: bool = True,
+        lookback_days: int = 12,
+    ) -> dict[str, Any]:
+        """国家队相关宽基 ETF 份额变动代理（非实时可归因买入）。
+
+        - 份额：上交所/深交所 T+1 披露；份额增减 ≠ 确认为汇金/证金下单
+        - 持有人：新浪定期报告十大持有人，最长滞后约半年；用关键词标记国家队席位
+        """
+        seed_by_code = {x["code"]: x for x in _NT_SEED_ETFS}
+        if codes:
+            norm = [self._normalize_etf_code(c) for c in codes]
+            selected = [c for c in norm if len(c) == 6][:12]
+        else:
+            selected = [x["code"] for x in _NT_SEED_ETFS]
+        if not selected:
+            raise MarketDataError("codes required")
+
+        as_of_day: date | None = None
+        if isinstance(as_of, date):
+            as_of_day = as_of
+        elif isinstance(as_of, str) and as_of.strip():
+            as_of_day = date.fromisoformat(as_of.strip()[:10])
+
+        holder_stale_days_threshold = 180
+        if self.mode == "mock":
+            items = []
+            flow_sum = 0.0
+            holders_as_of = "2025-12-31"
+            stale_days = (date.today() - date.fromisoformat(holders_as_of)).days
+            holder_status = "stale" if stale_days > holder_stale_days_threshold else "ok"
+            for i, code in enumerate(selected):
+                share = 2_000_000_000.0 + i * 100_000_000.0
+                prev = share * 0.99
+                change = share - prev
+                nav = 4.0 + i * 0.1
+                flow = round(change * nav, 2)
+                flow_sum += flow
+                name = (seed_by_code.get(code) or {}).get("name") or self._mock_quote(code)["name"]
+                items.append(
+                    {
+                        "code": code,
+                        "name": name,
+                        "exchange": self._etf_exchange(code),
+                        "share": share,
+                        "prev_share": prev,
+                        "share_change": change,
+                        "share_change_pct": round(change / prev * 100.0, 4),
+                        "nav": nav,
+                        "estimated_net_flow": flow,
+                        "flow_status": "ok",
+                        "holders_as_of": holders_as_of,
+                        "holder_report_period": holders_as_of,
+                        "staleness_days": stale_days,
+                        "nt_holders": [
+                            {
+                                "rank": 1,
+                                "name": "中央汇金投资有限责任公司",
+                                "hold_amount": share * 0.4,
+                                "hold_ratio": 40.0,
+                                "is_nt": True,
+                            }
+                        ],
+                        "nt_hold_ratio_sum": 40.0,
+                        "holder_status": holder_status,
+                        "holder_tip": (
+                            f"持有人报告期滞后 {stale_days} 天（阈值 {holder_stale_days_threshold}），"
+                            "无最新定期报告，勿当作近期加减仓证据。"
+                            if holder_status == "stale"
+                            else None
+                        ),
+                    }
+                )
+            return {
+                "as_of": (as_of_day or date.today()).isoformat(),
+                "prev_as_of": ((as_of_day or date.today()) - timedelta(days=1)).isoformat(),
+                "attribution": "proxy",
+                "usable_as_realtime_nt_orders": False,
+                "holder_stale_days_threshold": holder_stale_days_threshold,
+                "count": len(items),
+                "items": items,
+                "summary": {
+                    "estimated_net_flow_sum": round(flow_sum, 2),
+                    "share_up": len(items),
+                    "share_down": 0,
+                    "share_flat": 0,
+                },
+                "gaps": [],
+                "note": (
+                    "mock：份额增减仅为代理信号；不可当作国家队实时买卖。"
+                    "持有人来自定期报告快照；滞后超阈值标 holder_status=stale。"
+                ),
+                "source": "mock",
+            }
+
+        primary, prev, sse_map = self._resolve_share_dates(
+            as_of=as_of_day, lookback_days=max(3, int(lookback_days or 12))
+        )
+        prev_map = sse_map.pop("__prev_map__", {}) if sse_map else {}
+        gaps: list[str] = []
+        if primary is None:
+            gaps.append("上交所近期无可用 ETF 份额披露日")
+        if primary and prev is None:
+            gaps.append("缺少上一披露日，无法计算份额变动")
+
+        nav_map = self._fetch_nav_map(selected)
+        items: list[dict[str, Any]] = []
+        flow_sum = 0.0
+        flow_usable = 0
+        up = down = flat = 0
+
+        for code in selected:
+            exchange = self._etf_exchange(code)
+            name = (seed_by_code.get(code) or {}).get("name") or code
+            cur_row: dict[str, Any] | None = None
+            prev_row: dict[str, Any] | None = None
+            if exchange == "SSE":
+                cur_row = sse_map.get(code)
+                prev_row = prev_map.get(code) if isinstance(prev_map, dict) else None
+            else:
+                if primary is not None:
+                    try:
+                        cur_row = self._szse_etf_share(code, primary)
+                    except MarketDataError as exc:
+                        gaps.append(f"{code} 深交所份额失败: {exc}")
+                if prev is not None:
+                    try:
+                        prev_row = self._szse_etf_share(code, prev)
+                    except MarketDataError as exc:
+                        gaps.append(f"{code} 深交所昨份额失败: {exc}")
+
+            if cur_row:
+                name = str(cur_row.get("name") or name)
+            share = (cur_row or {}).get("share")
+            prev_share = (prev_row or {}).get("share")
+            share_change = None
+            share_change_pct = None
+            estimated_flow = None
+            flow_status = "unavailable"
+            nav = nav_map.get(code)
+            if share is not None and prev_share not in (None, 0):
+                share_change = float(share) - float(prev_share)
+                share_change_pct = round(share_change / float(prev_share) * 100.0, 4)
+                if nav is not None:
+                    estimated_flow = round(share_change * float(nav), 2)
+                    flow_status = "ok"
+                    flow_sum += estimated_flow
+                    flow_usable += 1
+                if share_change > 0:
+                    up += 1
+                elif share_change < 0:
+                    down += 1
+                else:
+                    flat += 1
+            elif share is None:
+                gaps.append(f"{code} 无份额数据")
+
+            nt_holders: list[dict[str, Any]] = []
+            holders_as_of: str | None = None
+            holder_status = "skipped"
+            staleness_days: int | None = None
+            holder_tip: str | None = None
+            if include_holders:
+                holder_status = "unavailable"
+                report_dates = self._sina_holder_report_dates(code)
+                for rd in report_dates[:3]:
+                    try:
+                        holders = self._sina_fund_holders(code, rd)
+                    except MarketDataError:
+                        holders = []
+                    nt = [h for h in holders if h.get("is_nt")]
+                    if nt:
+                        nt_holders = nt
+                        holders_as_of = rd
+                        holder_status = "ok"
+                        break
+                if holder_status != "ok" and report_dates:
+                    # 无国家队席位也返回空列表并标明报告期
+                    try:
+                        all_h = self._sina_fund_holders(code, report_dates[0])
+                    except MarketDataError:
+                        all_h = []
+                    if all_h:
+                        holders_as_of = report_dates[0]
+                        holder_status = "ok_no_nt"
+                        nt_holders = []
+                if holders_as_of:
+                    try:
+                        report_day = date.fromisoformat(str(holders_as_of)[:10])
+                        staleness_days = (date.today() - report_day).days
+                        if staleness_days > holder_stale_days_threshold:
+                            holder_status = "stale"
+                            holder_tip = (
+                                f"持有人报告期 {holders_as_of} 滞后 {staleness_days} 天"
+                                f"（阈值 {holder_stale_days_threshold}），无最新定期报告，"
+                                "勿当作近期加减仓证据。"
+                            )
+                    except ValueError:
+                        staleness_days = None
+
+            nt_ratio_sum = None
+            if nt_holders:
+                nt_ratio_sum = round(
+                    sum(float(h["hold_ratio"]) for h in nt_holders if h.get("hold_ratio") is not None),
+                    4,
+                )
+
+            items.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "exchange": exchange,
+                    "share": share,
+                    "prev_share": prev_share,
+                    "share_change": share_change,
+                    "share_change_pct": share_change_pct,
+                    "nav": nav,
+                    "estimated_net_flow": estimated_flow,
+                    "flow_status": flow_status,
+                    "holders_as_of": holders_as_of,
+                    "holder_report_period": holders_as_of,
+                    "staleness_days": staleness_days,
+                    "nt_holders": nt_holders,
+                    "nt_hold_ratio_sum": nt_ratio_sum,
+                    "holder_status": holder_status,
+                    "holder_tip": holder_tip,
+                }
+            )
+
+        return {
+            "as_of": primary.isoformat() if primary else None,
+            "prev_as_of": prev.isoformat() if prev else None,
+            "attribution": "proxy",
+            "usable_as_realtime_nt_orders": False,
+            "holder_stale_days_threshold": holder_stale_days_threshold,
+            "count": len(items),
+            "items": items,
+            "summary": {
+                "estimated_net_flow_sum": round(flow_sum, 2) if flow_usable else None,
+                "share_up": up,
+                "share_down": down,
+                "share_flat": flat,
+                "flow_ok_count": flow_usable,
+            },
+            "gaps": gaps,
+            "note": (
+                "attribution=proxy：交易所 T+1 份额增减是申赎总量代理，"
+                "不能归因到汇金/证金/社保的实时买卖。"
+                "nt_holders 来自新浪定期报告十大持有人；"
+                f"holders_as_of 滞后超过 {holder_stale_days_threshold} 天时 holder_status=stale。"
+                "estimated_net_flow≈份额变动×净值，单位元。"
+            ),
+            "source": "SSE/SZSE ETF share + sina CaihuiFundInfoService.getFundHolder",
         }
 
     def _batch_quotes(
@@ -2076,14 +2980,16 @@ class MarketDataProvider:
         self, start: date, end: date, min_importance: int
     ) -> list[dict[str, Any]]:
         mid = start + timedelta(days=min(2, (end - start).days))
+        past = start
         return [
             {
-                "time": f"{mid.isoformat()} 09:30",
+                "time": f"{past.isoformat()} 09:30",
                 "country": "中国",
                 "title": "制造业 PMI",
                 "kind": "data",
                 "importance": max(min_importance, 3),
-                "actual": None,
+                "actual": "50.1",
+                "actual_status": "released",
                 "forecast": "50.2",
                 "previous": "50.0",
                 "unit": "",
@@ -2095,6 +3001,7 @@ class MarketDataProvider:
                 "kind": "data",
                 "importance": 4,
                 "actual": None,
+                "actual_status": "pending",
                 "forecast": "18万",
                 "previous": "15万",
                 "unit": "",

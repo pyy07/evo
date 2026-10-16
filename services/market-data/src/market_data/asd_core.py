@@ -337,6 +337,21 @@ def tencent_quote(codes: list[str]) -> dict[str, dict]:
             "vol_ratio":    float(vals[49]) if vals[49] else 0,
             "pe_static":    float(vals[52]) if vals[52] else 0,
         }
+        # ETF：腾讯字段 78≈IOPV/估算净值，81≈已披露净值（收盘后 GSZ 常空时可用）
+        bare = "".join(ch for ch in str(code) if ch.isdigit())[-6:]
+        if bare.startswith(("15", "16", "51", "56", "58")) and len(vals) > 81:
+            try:
+                iopv = float(vals[78]) if vals[78] else None
+            except ValueError:
+                iopv = None
+            try:
+                fund_nav = float(vals[81]) if vals[81] else None
+            except ValueError:
+                fund_nav = None
+            if iopv and iopv > 0:
+                result[code]["iopv"] = iopv
+            if fund_nav and fund_nav > 0:
+                result[code]["fund_nav"] = fund_nav
         # 僵尸报价检测：腾讯对「已迁移的北交所老码 / 长期停牌股」照样返回 HTTP 200 +
         # 一份定格在最后交易日的报价（成交量 0、最新价==昨收），不报任何错。
         # 直接拿去算估值会得出完全错误的结论（实测 bj832982 报 112.60，真实新码 920982 为 131.74）。

@@ -12,8 +12,6 @@ from evo_api.models.entities import (
     CapabilityStatus,
     ChangeRequest,
     ChangeRequestStatus,
-    InvestmentDecision,
-    Review,
 )
 from evo_api.services import portfolio as portfolio_svc
 from evo_api.services.memory import memory_summary
@@ -53,10 +51,6 @@ def timeline(
     _: None = Depends(require_admin),
 ) -> dict[str, Any]:
     runs = db.query(AgentRun).order_by(AgentRun.id.desc()).limit(50).all()
-    decisions = (
-        db.query(InvestmentDecision).order_by(InvestmentDecision.id.desc()).limit(50).all()
-    )
-    reviews = db.query(Review).order_by(Review.id.desc()).limit(50).all()
     return {
         "agent_runs": [
             {
@@ -69,32 +63,51 @@ def timeline(
             }
             for r in runs
         ],
-        "decisions": [
-            {
-                "id": d.id,
-                "summary": d.summary,
-                "hypothesis": d.hypothesis,
-                "action_plan": d.action_plan,
-                "usage_notes": d.usage_notes or [],
-                "agent_run_id": d.agent_run_id,
-                "observation_id": d.observation_id,
-                "thesis_id": d.thesis_id,
-                "created_at": d.created_at.isoformat() if d.created_at else None,
-            }
-            for d in decisions
-        ],
-        "reviews": [
-            {
-                "id": r.id,
-                "issue_type": r.issue_type.value,
-                "content": r.content,
-                "decision_id": r.decision_id,
-                "change_request_id": r.change_request_id,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-            for r in reviews
-        ],
+        "decisions": portfolio_svc.list_decisions(db, limit=50)["items"],
+        "reviews": portfolio_svc.list_reviews(db, limit=50)["items"],
     }
+
+
+@router.get("/decisions")
+def list_decisions(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    return portfolio_svc.list_decisions(db, limit=limit)
+
+
+@router.get("/decisions/{decision_id}")
+def get_decision(
+    decision_id: int,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    row = portfolio_svc.get_decision(db, decision_id)
+    if not row:
+        raise HTTPException(404, "未找到决策")
+    return row
+
+
+@router.get("/reviews")
+def list_reviews(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    return portfolio_svc.list_reviews(db, limit=limit)
+
+
+@router.get("/reviews/{review_id}")
+def get_review(
+    review_id: int,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    row = portfolio_svc.get_review(db, review_id)
+    if not row:
+        raise HTTPException(404, "未找到复盘")
+    return row
 
 
 @router.get("/portfolio")

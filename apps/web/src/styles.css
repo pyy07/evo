@@ -600,6 +600,13 @@ button.linkish {
   color: var(--danger);
 }
 
+.badge.soft {
+  background: var(--paper-2);
+  border-color: var(--rule);
+  color: var(--slate);
+  font-weight: 600;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -635,12 +642,151 @@ button.linkish {
 .mem-cell {
   background: var(--paper-2);
   padding: 0.55rem 0.65rem;
+  border: 0;
+  text-align: left;
+  width: 100%;
+  display: block;
+  color: inherit;
+}
+
+.mem-cell.clickable {
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.mem-cell.clickable:hover {
+  background: #e3d7c0;
 }
 
 .mem-cell b {
   display: block;
   font-family: Fraunces, serif;
   font-size: 1.2rem;
+}
+
+.mem-go {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--stamp);
+  font-weight: 600;
+}
+
+.back-bar {
+  margin: 0 0 0.75rem;
+}
+
+.detail-panel {
+  margin-top: 0.25rem;
+}
+
+.record-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.record-row {
+  appearance: none;
+  border: 0;
+  border-bottom: 1px dashed var(--rule);
+  background: transparent;
+  text-align: left;
+  padding: 0.85rem 0.35rem;
+  cursor: pointer;
+  color: inherit;
+  width: 100%;
+}
+
+.record-row:hover {
+  background: var(--paper-2);
+}
+
+.record-row:last-child {
+  border-bottom: 0;
+}
+
+.record-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.25rem;
+  align-items: baseline;
+}
+
+.record-top time {
+  color: var(--slate);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.record-row p {
+  margin: 0.2rem 0 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--ink-soft);
+}
+
+.record-top .badge.soft {
+  margin-left: 0.45rem;
+  font-size: 0.7rem;
+  vertical-align: middle;
+}
+
+.feed-item.clickable {
+  cursor: pointer;
+}
+
+.feed-item.clickable:hover {
+  background: rgba(63, 92, 69, 0.06);
+}
+
+.go-detail {
+  margin-top: 0.4rem !important;
+  color: var(--stamp) !important;
+  font-weight: 600;
+  font-size: 0.8rem !important;
+}
+
+.detail-block {
+  margin: 1rem 0 1.25rem;
+}
+
+.detail-block h3 {
+  margin: 0 0 0.45rem;
+  font-size: 0.95rem;
+  font-family: "Noto Serif SC", serif;
+}
+
+.detail-block .prose {
+  margin: 0;
+  white-space: pre-wrap;
+  line-height: 1.65;
+  color: var(--ink-soft);
+  font-size: 0.92rem;
+}
+
+.detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem;
+  margin: -0.35rem 0 1rem;
+  align-items: center;
+}
+
+.review-body {
+  margin: 0;
+  padding: 0.85rem 1rem;
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "Noto Sans SC", sans-serif;
+  font-size: 0.9rem;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  max-height: 70vh;
+  overflow: auto;
 }
 
 .lessons {

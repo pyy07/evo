@@ -12,8 +12,6 @@ from evo_api.models.entities import (
     CapabilityStatus,
     ChangeRequest,
     ChangeRequestStatus,
-    Experience,
-    ExperienceKind,
     InvestmentDecision,
     IssueType,
     Observation,
@@ -88,32 +86,14 @@ def _save_lessons(
     review_id: int | None,
     agent_run_id: int | None,
 ) -> list[int]:
-    if not lessons:
-        return []
-    require_review_window()
-    ids: list[int] = []
-    for item in lessons:
-        if isinstance(item, str):
-            kind = ExperienceKind.investment
-            content = item.strip()
-        elif isinstance(item, dict):
-            kind_raw = item.get("kind") or "investment"
-            kind = ExperienceKind(kind_raw)
-            content = str(item.get("content") or "").strip()
-        else:
-            continue
-        if not content:
-            continue
-        exp = Experience(
-            kind=kind,
-            content=content,
-            source_review_id=review_id,
-            agent_run_id=agent_run_id,
-        )
-        db.add(exp)
-        db.flush()
-        ids.append(exp.id)
-    return ids
+    from evo_api.services.experiences import save_lessons
+
+    return save_lessons(
+        db,
+        lessons,
+        review_id=review_id,
+        agent_run_id=agent_run_id,
+    )
 
 
 def invoke_capability(
@@ -275,6 +255,7 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
             lambda: get_provider().industry_comparison(
                 top_n=int(payload.get("top_n") or 10),
                 board=board,
+                min_member_count=int(payload.get("min_member_count") or 3),
             ),
             {"board": board, "top": [], "bottom": [], "total": 0},
         )
@@ -324,6 +305,28 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
     if impl == "get_etf_premium":
         codes = _require(payload, "codes")
         return get_provider().get_etf_premium(list(codes))
+
+    if impl == "get_national_team_flow":
+        codes = payload.get("codes")
+        include_holders = payload.get("include_holders")
+        lookback_days = payload.get("lookback_days")
+        return _market_soft(
+            lambda: get_provider().get_national_team_flow(
+                codes=list(codes) if codes else None,
+                as_of=payload.get("as_of"),
+                include_holders=True if include_holders is None else bool(include_holders),
+                lookback_days=int(lookback_days or 12),
+            ),
+            {
+                "attribution": "proxy",
+                "usable_as_realtime_nt_orders": False,
+                "count": 0,
+                "items": [],
+                "summary": {},
+                "gaps": ["国家队代理上游失败，已降级"],
+                "degraded": True,
+            },
+        )
 
     if impl == "get_market_news":
         scope = str(payload.get("scope") or "market")
@@ -590,23 +593,17 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
         return {"items": [_cr_item(r) for r in rows]}
 
     if impl == "list_experiences":
-        q = db.query(Experience).order_by(Experience.id.desc())
-        if payload.get("kind"):
-            q = q.filter(Experience.kind == ExperienceKind(payload["kind"]))
-        limit = min(int(payload.get("limit") or 20), 100)
-        rows = q.limit(limit).all()
-        return {
-            "items": [
-                {
-                    "id": r.id,
-                    "kind": r.kind.value,
-                    "content": r.content,
-                    "source_review_id": r.source_review_id,
-                    "created_at": r.created_at.isoformat() if r.created_at else None,
-                }
-                for r in rows
-            ]
-        }
+        from evo_api.services.experiences import list_experiences
+
+        include_usage = payload.get("include_usage")
+        if include_usage is None:
+            include_usage = False
+        return list_experiences(
+            db,
+            kind=str(payload["kind"]) if payload.get("kind") else None,
+            include_usage=bool(include_usage),
+            limit=int(payload.get("limit") or 20),
+        )
 
     if impl == "verify_change_request":
         require_review_window()

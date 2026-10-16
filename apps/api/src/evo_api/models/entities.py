@@ -300,10 +300,15 @@ class Experience(Base):
     kind: Mapped[ExperienceKind] = mapped_column(
         Enum(ExperienceKind), default=ExperienceKind.investment
     )
+    # 同 kind+fingerprint：agent/system 原地更新；investment 同指纹则去重不追加
+    fingerprint: Mapped[Optional[str]] = mapped_column(String(200), nullable=True, index=True)
     content: Mapped[str] = mapped_column(Text)
     source_review_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     agent_run_id: Mapped[Optional[int]] = mapped_column(ForeignKey("agent_runs.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class AuditLog(Base):

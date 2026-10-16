@@ -96,7 +96,21 @@ def test_market_overview_capability(client):
     assert "usable_for_style" in hbody
     prem = _invoke(client, "get_etf_premium", {"codes": ["510300"]})
     assert prem.status_code == 200
-    assert prem.json()["result"]["items"][0]["premium_pct"] is not None
+    prem_body = prem.json()["result"]
+    assert prem_body["items"][0]["premium_pct"] is not None
+    assert prem_body["items"][0]["share_change_status"] in ("t1_only", "unavailable", "ok")
+    assert prem_body.get("share_usable_for_intraday") is False
+    nt = _invoke(client, "get_national_team_flow", {"codes": ["510300", "510050"]})
+    assert nt.status_code == 200
+    nt_body = nt.json()["result"]
+    assert nt_body["attribution"] == "proxy"
+    assert nt_body["usable_as_realtime_nt_orders"] is False
+    assert nt_body["count"] >= 1
+    assert "holder_report_period" in nt_body["items"][0]
+    assert "staleness_days" in nt_body["items"][0]
+    idx015 = _invoke(client, "get_index_valuation", {"code": "000015"})
+    assert idx015.status_code == 200
+    assert idx015.json()["result"]["name"] == "红利指数"
     assert body.get("hsgt") is not None or body.get("degraded") is not None
     hist = _invoke(client, "get_etf_history", {"code": "510300", "count": 12})
     assert hist.status_code == 200
@@ -368,6 +382,51 @@ def test_admin_desk_includes_settlements(client, monkeypatch):
     assert "trades_history" in body
 
 
+def test_admin_decisions_and_reviews_detail(client, monkeypatch):
+    monkeypatch.setattr("evo_api.services.market_session.now_cn", lambda: POSTCLOSE_NOW)
+    headers = {"Authorization": "Bearer test-admin"}
+    # seed a decision via capability if available in fixtures; otherwise create through submit_decision
+    run = _invoke(client, "start_agent_run", {"trigger": "test"})
+    assert run.status_code == 200
+    run_id = run.json()["result"]["agent_run_id"]
+    decided = _invoke(
+        client,
+        "submit_decision",
+        {
+            "agent_run_id": run_id,
+            "summary": "测试决策摘要",
+            "hypothesis": "假设成立",
+            "action_plan": "观望",
+            "usage_notes": [{"kind": "note", "content": "仅测试"}],
+        },
+    )
+    assert decided.status_code == 200
+    decision_id = decided.json()["result"]["decision_id"]
+
+    listed = client.get("/admin/decisions", headers=headers)
+    assert listed.status_code == 200
+    assert any(x["id"] == decision_id for x in listed.json()["items"])
+    detail = client.get(f"/admin/decisions/{decision_id}", headers=headers)
+    assert detail.status_code == 200
+    assert detail.json()["summary"] == "测试决策摘要"
+    assert "invocations" in detail.json()
+
+    review = _invoke(
+        client,
+        "submit_review",
+        {"issue_type": "NoIssue", "content": "## 测试复盘\n- 今日无事"},
+    )
+    assert review.status_code == 200
+    review_id = review.json()["result"]["review_id"]
+    rlist = client.get("/admin/reviews", headers=headers)
+    assert rlist.status_code == 200
+    assert any(x["id"] == review_id for x in rlist.json()["items"])
+    rdetail = client.get(f"/admin/reviews/{review_id}", headers=headers)
+    assert rdetail.status_code == 200
+    assert "测试复盘" in rdetail.json()["content"]
+    assert client.get("/admin/reviews/999999", headers=headers).status_code == 404
+
+
 def test_empty_postclose_review_without_cr_or_lessons(client, monkeypatch):
     monkeypatch.setattr("evo_api.services.market_session.now_cn", lambda: POSTCLOSE_NOW)
     r = _invoke(
@@ -459,7 +518,10 @@ def test_seed_experiences_loaded(client):
     assert "大盘→行业→ETF" in texts
     assert "中长期" in texts
     assert "T+1" in texts
-    assert "a-stock-data" in texts
+    # 能力演进类种子已归为 system，默认 list 不含；需 include_usage
+    mixed = _invoke(client, "list_experiences", {"include_usage": True, "limit": 30})
+    mixed_texts = " ".join(i["content"] for i in mixed.json()["result"]["items"])
+    assert "a-stock-data" in mixed_texts
 
 
 def test_t_plus_one_blocks_same_day_sell(client, monkeypatch):
@@ -614,3 +676,57 @@ def test_lessons_persisted_postclose(client, monkeypatch):
     assert r.json()["result"]["experience_ids"]
     listed = _invoke(client, "list_experiences", {"limit": 5})
     assert any("午后缩量" in i["content"] for i in listed.json()["result"]["items"])
+
+
+def test_usage_lessons_upsert_by_fingerprint(client, monkeypatch):
+    monkeypatch.setattr("evo_api.services.market_session.now_cn", lambda: POSTCLOSE_NOW)
+    first = _invoke(
+        client,
+        "submit_review",
+        {
+            "issue_type": "NoIssue",
+            "content": "复盘-用法1",
+            "lessons": [
+                {
+                    "kind": "agent",
+                    "fingerprint": "[usage] get_etf_premium IOPV",
+                    "content": "[usage] get_etf_premium IOPV\n旧：iopv 不可用",
+                }
+            ],
+        },
+    )
+    assert first.status_code == 200
+    id1 = first.json()["result"]["experience_ids"][0]
+    second = _invoke(
+        client,
+        "submit_review",
+        {
+            "issue_type": "NoIssue",
+            "content": "复盘-用法2",
+            "lessons": [
+                {
+                    "kind": "agent",
+                    "fingerprint": "[usage] get_etf_premium IOPV",
+                    "content": "[usage] get_etf_premium IOPV\n新：腾讯 IOPV 回退可用",
+                }
+            ],
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["result"]["experience_ids"] == [id1]
+    usage = _invoke(client, "list_experiences", {"kind": "agent", "limit": 20})
+    hits = [i for i in usage.json()["result"]["items"] if i.get("fingerprint") == "[usage] get_etf_premium IOPV"]
+    assert len(hits) == 1
+    assert "腾讯 IOPV" in hits[0]["content"]
+    assert "旧：iopv 不可用" not in hits[0]["content"]
+
+
+def test_list_experiences_defaults_to_investment(client):
+    listed = _invoke(client, "list_experiences", {"limit": 20})
+    assert listed.status_code == 200
+    kinds = {i["kind"] for i in listed.json()["result"]["items"]}
+    assert kinds <= {"investment"}
+    assert "大盘→行业→ETF" in " ".join(i["content"] for i in listed.json()["result"]["items"])
+    mixed = _invoke(client, "list_experiences", {"include_usage": True, "limit": 30})
+    mixed_kinds = {i["kind"] for i in mixed.json()["result"]["items"]}
+    assert "investment" in mixed_kinds

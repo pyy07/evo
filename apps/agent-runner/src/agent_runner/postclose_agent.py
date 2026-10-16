@@ -27,6 +27,7 @@ POSTCLOSE_CAPABILITY_TOOLS = frozenset(
         "get_board_fund_flow",
         "get_hsgt_flow",
         "get_etf_premium",
+        "get_national_team_flow",
         "get_market_news",
         "get_announcements",
         "get_macro_digest",
@@ -61,12 +62,19 @@ FINALIZE_TOOL: dict[str, Any] = {
                 },
                 "lessons": {
                     "type": "array",
+                    "description": (
+                        "以投资经验为主；agent/system 须带 fingerprint 以便覆盖更新"
+                    ),
                     "items": {
                         "type": "object",
                         "properties": {
                             "kind": {
                                 "type": "string",
                                 "enum": ["investment", "agent", "system"],
+                            },
+                            "fingerprint": {
+                                "type": "string",
+                                "description": "如 [usage] get_etf_premium；agent/system 必填",
                             },
                             "content": {"type": "string"},
                         },

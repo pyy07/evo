@@ -143,7 +143,7 @@ def test_mock_index_valuation_and_breadth():
     premium = p.get_etf_premium(["510300", "510050"])
     assert premium["count"] == 2
     assert premium["items"][0]["premium_pct"] is not None
-    assert premium["items"][0]["share_change_status"] == "unavailable"
+    assert premium["items"][0]["share_change_status"] == "t1_only"
 
 
 def test_overview_filters_concept_noise_and_compacts():
@@ -232,6 +232,142 @@ def test_concept_noise_covers_report_labels():
     assert _is_concept_noise({"code": "BK1199", "name": "2025三季报预减"})
     assert _is_concept_noise({"code": "BK1750", "name": "2026中报扭亏"})
     assert not _is_concept_noise({"code": "BK0481", "name": "半导体"})
+
+
+def test_dedupe_parent_child_boards():
+    from market_data.provider import _dedupe_parent_child_boards
+
+    rows = _dedupe_parent_child_boards(
+        [
+            {"code": "BK1201", "name": "电子", "main_net": 1},
+            {"code": "BK1036", "name": "半导体", "main_net": 2},
+            {"code": "BK0437", "name": "煤炭", "main_net": 3},
+            {"code": "BK1493", "name": "动力煤", "main_net": 4},
+            {"code": "BK1250", "name": "煤炭开采", "main_net": 5},
+        ]
+    )
+    names = [r["name"] for r in rows]
+    assert "电子" in names
+    assert "半导体" not in names
+    assert "煤炭" in names
+    assert "动力煤" not in names
+    assert "煤炭开采" not in names
+
+
+def test_mock_etf_premium_marks_iopv_basis():
+    p = MarketDataProvider(mode="mock")
+    premium = p.get_etf_premium(["510300"])
+    item = premium["items"][0]
+    assert item["premium_basis"] == "iopv"
+    assert item["nav_is_stale"] is False
+    assert item["iopv_status"] == "ok"
+
+
+def test_parse_cn_month_from_macro_title():
+    from market_data.news import _parse_cn_month_from_macro_title
+
+    assert _parse_cn_month_from_macro_title("9月CPI同比", "2026-10-14 09:30") == "2026-09"
+    assert _parse_cn_month_from_macro_title("2026年09月PPI同比", "2026-10-14 09:30") == "2026-09"
+
+
+def test_backfill_china_cpi_ppi_marks_released():
+    from market_data import news as news_mod
+
+    items = [
+        {
+            "time": "2026-10-14 09:30",
+            "country": "中国",
+            "title": "9月CPI同比",
+            "kind": "data",
+            "importance": 3,
+            "actual": None,
+            "actual_status": "unavailable",
+            "forecast": None,
+            "previous": 0.8,
+            "unit": "%",
+        },
+        {
+            "time": "2026-10-14 09:30",
+            "country": "中国",
+            "title": "9月PPI同比",
+            "kind": "data",
+            "importance": 3,
+            "actual": None,
+            "actual_status": "unavailable",
+            "forecast": None,
+            "previous": 3.8,
+            "unit": "%",
+        },
+    ]
+
+    def fake_series(report_name: str, *, page_size: int = 8):
+        if report_name == "RPT_ECONOMY_CPI":
+            return [{"REPORT_DATE": "2026-09-01 00:00:00", "NATIONAL_SAME": 0.9}]
+        if report_name == "RPT_ECONOMY_PPI":
+            return [{"REPORT_DATE": "2026-09-01 00:00:00", "BASE_SAME": 5.0}]
+        return []
+
+    news_mod._eastmoney_economy_series = fake_series  # type: ignore[assignment]
+    out = news_mod._backfill_china_cpi_ppi(items)
+    assert out[0]["actual"] == 0.9
+    assert out[0]["actual_status"] == "released"
+    assert out[0]["actual_source"]
+    assert out[1]["actual"] == 5.0
+    assert out[1]["actual_status"] == "released"
+
+
+def test_mock_etf_premium_includes_t1_share_change():
+    p = MarketDataProvider(mode="mock")
+    premium = p.get_etf_premium(["510300", "510880"])
+    assert premium["share_as_of"]
+    assert premium["share_usable_for_intraday"] is False
+    item = premium["items"][0]
+    assert item["share_change_status"] == "t1_only"
+    assert item["share"] is not None
+    assert item["share_change"] is not None
+    assert item["estimated_net_flow"] is not None
+    assert item["share_as_of"] == premium["share_as_of"]
+
+
+def test_mock_national_team_flow_is_honest_proxy():
+    p = MarketDataProvider(mode="mock")
+    out = p.get_national_team_flow(codes=["510300", "510050"])
+    assert out["attribution"] == "proxy"
+    assert out["usable_as_realtime_nt_orders"] is False
+    assert out["count"] == 2
+    item = out["items"][0]
+    assert item["code"] == "510300"
+    assert item["share"] is not None
+    assert item["share_change"] is not None
+    assert item["flow_status"] == "ok"
+    assert item["estimated_net_flow"] is not None
+    assert any(h.get("is_nt") for h in item["nt_holders"])
+    assert out["summary"]["estimated_net_flow_sum"] is not None
+    assert "holder_report_period" in item
+    assert "staleness_days" in item
+    assert item["holder_status"] in ("ok", "stale", "ok_no_nt", "unavailable", "skipped")
+
+
+def test_nt_holder_keyword_match():
+    assert MarketDataProvider._is_national_team_holder("中央汇金投资有限责任公司")
+    assert MarketDataProvider._is_national_team_holder("中国证券金融股份有限公司")
+    assert MarketDataProvider._is_national_team_holder("全国社保基金一一八组合")
+    assert not MarketDataProvider._is_national_team_holder("某某私募基金管理有限公司")
+
+
+def test_mock_index_valuation_maps_dividend_index_name():
+    p = MarketDataProvider(mode="mock")
+    val = p.get_index_valuation("000015")
+    assert val["name"] == "红利指数"
+    assert val["index_code"] == "000015"
+    assert "ulist_error" not in val or val.get("degraded") is True
+
+
+def test_mock_macro_has_actual_status():
+    p = MarketDataProvider(mode="mock")
+    dig = p.get_macro_digest(days_ahead=5, days_back=1)
+    assert dig["calendar"]
+    assert all("actual_status" in x for x in dig["calendar"])
 
 
 def test_hsgt_rejects_quota_as_net_buy():

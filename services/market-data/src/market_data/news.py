@@ -366,6 +366,22 @@ def fetch_macro_calendar(
                 continue
             if country and item.get("country") != country:
                 continue
+            actual_raw = item.get("actual")
+            if actual_raw in ("", None):
+                # 部分字段用 value / revised 承载已公布值
+                for alt in ("value", "revised", "actual_value", "pub_value"):
+                    if item.get(alt) not in ("", None):
+                        actual_raw = item.get(alt)
+                        break
+            actual = actual_raw if actual_raw not in ("", None) else None
+            now_cn = datetime.now(_CN_TZ)
+            if actual is not None:
+                actual_status = "released"
+            elif when <= now_cn:
+                # 已过发布时间但仍无值：明确 unavailable，勿当成「未到点」
+                actual_status = "unavailable"
+            else:
+                actual_status = "pending"
             rows[item.get("id") or f"{stamp}-{item.get('title')}"] = {
                 "time": when.strftime("%Y-%m-%d %H:%M"),
                 "country": item.get("country"),
@@ -374,7 +390,8 @@ def fetch_macro_calendar(
                     item.get("calendar_type"), item.get("calendar_type")
                 ),
                 "importance": level,
-                "actual": item.get("actual") if item.get("actual") not in ("", None) else None,
+                "actual": actual,
+                "actual_status": actual_status,
                 "forecast": item.get("forecast")
                 if item.get("forecast") not in ("", None)
                 else None,
@@ -384,7 +401,133 @@ def fetch_macro_calendar(
                 "unit": item.get("unit") or None,
             }
         cursor = stop + timedelta(days=1)
-    return sorted(rows.values(), key=lambda r: r["time"])
+    out = sorted(rows.values(), key=lambda r: r["time"])
+    return _backfill_china_cpi_ppi(out)
+
+
+def _parse_cn_month_from_macro_title(title: str, event_time: str) -> str | None:
+    """从『9月CPI同比』+ 事件时间推断报告月 YYYY-MM。"""
+    title = str(title or "")
+    m = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", title)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"
+    m = re.search(r"(\d{1,2})\s*月", title)
+    if not m:
+        return None
+    month = int(m.group(1))
+    if not (1 <= month <= 12):
+        return None
+    year = None
+    if isinstance(event_time, str) and len(event_time) >= 7:
+        try:
+            event_day = date.fromisoformat(event_time[:10])
+            # 发布日通常在次月：10/14 发 9 月数据
+            year = event_day.year if month <= event_day.month else event_day.year - 1
+            if month == event_day.month and event_day.day <= 10:
+                # 月初发布上月的情况少见；仍按同月
+                year = event_day.year
+        except ValueError:
+            year = None
+    if year is None:
+        year = date.today().year
+    return f"{year:04d}-{month:02d}"
+
+
+def _eastmoney_economy_series(report_name: str, *, page_size: int = 8) -> list[dict[str, Any]]:
+    params = {
+        "reportName": report_name,
+        "columns": "ALL",
+        "pageSize": str(page_size),
+        "pageNumber": "1",
+        "sortColumns": "REPORT_DATE",
+        "sortTypes": "-1",
+    }
+    url = "https://datacenter-web.eastmoney.com/api/data/v1/get?" + urllib.parse.urlencode(params)
+    raw, _ = _request(
+        url,
+        headers={"Referer": "https://data.eastmoney.com/", "User-Agent": UA},
+        timeout=15,
+        eastmoney=True,
+    )
+    payload = json.loads(raw.decode("utf-8", "replace"))
+    if not (payload or {}).get("success"):
+        return []
+    rows = ((payload or {}).get("result") or {}).get("data") or []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _backfill_china_cpi_ppi(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """WSCN 对中国 CPI/PPI 常留空 actual：用东财经济数据表回填已发布值。"""
+    need = [
+        it
+        for it in items
+        if str(it.get("country") or "") in {"中国", "CN", "China"}
+        and it.get("actual") in (None, "")
+        and it.get("actual_status") == "unavailable"
+        and any(k in str(it.get("title") or "") for k in ("CPI", "PPI"))
+    ]
+    if not need:
+        return items
+    cpi_rows: list[dict[str, Any]] = []
+    ppi_rows: list[dict[str, Any]] = []
+    try:
+        if any("CPI" in str(it.get("title") or "") for it in need):
+            cpi_rows = _eastmoney_economy_series("RPT_ECONOMY_CPI")
+        if any("PPI" in str(it.get("title") or "") for it in need):
+            ppi_rows = _eastmoney_economy_series("RPT_ECONOMY_PPI")
+    except Exception:  # noqa: BLE001
+        return items
+
+    def _by_month(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            rd = str(row.get("REPORT_DATE") or "")[:10]
+            if len(rd) >= 7:
+                out[rd[:7]] = row
+        return out
+
+    cpi_map = _by_month(cpi_rows)
+    ppi_map = _by_month(ppi_rows)
+    for it in items:
+        if it.get("actual") not in (None, ""):
+            continue
+        if str(it.get("country") or "") not in {"中国", "CN", "China"}:
+            continue
+        if it.get("actual_status") != "unavailable":
+            continue
+        title = str(it.get("title") or "")
+        month_key = _parse_cn_month_from_macro_title(title, str(it.get("time") or ""))
+        if not month_key:
+            continue
+        value = None
+        source = None
+        if "CPI" in title:
+            row = cpi_map.get(month_key)
+            if row:
+                if "环比" in title:
+                    value = row.get("NATIONAL_SEQUENTIAL")
+                else:
+                    value = row.get("NATIONAL_SAME")
+                source = "eastmoney RPT_ECONOMY_CPI"
+        elif "PPI" in title:
+            row = ppi_map.get(month_key)
+            if row:
+                if "环比" in title:
+                    value = row.get("BASE_SEQUENTIAL") or row.get("SEQUENTIAL")
+                else:
+                    value = row.get("BASE_SAME")
+                source = "eastmoney RPT_ECONOMY_PPI"
+        if value in (None, ""):
+            continue
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            continue
+        it["actual"] = num
+        it["actual_status"] = "released"
+        it["actual_source"] = source
+        it["actual_period"] = month_key
+    return items
 
 
 def fetch_cctv_news(day: date, *, with_content: bool = False, max_chars: int = 400) -> list[dict[str, Any]]:

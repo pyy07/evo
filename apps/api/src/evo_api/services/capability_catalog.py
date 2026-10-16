@@ -143,7 +143,7 @@ CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "get_industry_ranking",
         "name": "行业/概念涨跌排名",
-        "description": "行业或概念板块涨跌幅排名（a-stock-data industry_comparison）",
+        "description": "行业或概念板块涨跌幅排名；主榜优先过滤极小样本板块（min_member_count）",
         "category": "market",
         "input_schema": {
             "type": "object",
@@ -154,6 +154,11 @@ CAPABILITIES: list[dict[str, Any]] = [
                     "default": "industry",
                 },
                 "top_n": {"type": "integer", "default": 10},
+                "min_member_count": {
+                    "type": "integer",
+                    "default": 3,
+                    "description": "主榜最少成分家数（up+down）；不足则 low_sample=true",
+                },
             },
         },
         "output_schema": {"type": "object"},
@@ -190,7 +195,8 @@ CAPABILITIES: list[dict[str, Any]] = [
         "name": "指数/ETF估值",
         "description": (
             "指数或宽基 ETF 估值：优先中证 PE/股息率与近期窗口 PE 分位；"
-            "返回 pe_percentile_window_start/end。ETF 快照 pe_ttm/pb 常为 0 或 '-'。"
+            "返回 pe_percentile_window_start/end。name 优先本地映射（含 000015 红利指数等），"
+            "东财 ulist 失败时 degraded=true/ulist_status=unavailable，不把代码当名称。"
             "pb_status=unavailable；pe_percentile_1y/3y 无同源时长为 null，勿当作全历史分位。"
         ),
         "category": "market",
@@ -236,8 +242,11 @@ CAPABILITIES: list[dict[str, Any]] = [
         "id": "get_etf_premium",
         "name": "ETF溢折价",
         "description": (
-            "ETF 市价相对最新净值的溢折价（东财 FundMNFInfo）。"
-            "premium_pct=(市价-净值)/净值*100。份额变动/净申赎无同源时标 unavailable，不编造。"
+            "ETF 市价相对最新净值的溢折价（东财 FundMNFInfo）+ 交易所 T+1 份额增减。"
+            "premium_pct 优先相对 IOPV；无 IOPV 时标 nav_is_stale。"
+            "份额字段 share_change_status=t1_only（as_of 为最近披露日），"
+            "share_usable_for_intraday=false，不可当作盘中当日申赎结论；"
+            "estimated_net_flow≈份额变动×净值（元）。"
         ),
         "category": "market",
         "input_schema": {
@@ -254,6 +263,46 @@ CAPABILITIES: list[dict[str, Any]] = [
         "output_schema": {"type": "object"},
         "permission": "agent",
         "implementation": "get_etf_premium",
+    },
+    {
+        "id": "get_national_team_flow",
+        "name": "国家队ETF动向代理",
+        "description": (
+            "宽基 ETF 国家队动向代理：交易所 T+1 份额增减 + 定期报告十大持有人中的"
+            "汇金/证金/社保席位。attribution=proxy，usable_as_realtime_nt_orders=false；"
+            "份额变动不能归因到国家队实时买卖。holders_as_of/holder_report_period 滞后"
+            "超过阈值（默认180天）时 holder_status=stale 并给出 tip。"
+            "默认观察池为历史上常被披露持有的宽基；可传 codes（最多12）。"
+            "estimated_net_flow≈份额变动×净值（元）。"
+        ),
+        "category": "market",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "ETF 代码列表，最多 12；默认国家队相关宽基种子池",
+                },
+                "as_of": {
+                    "type": "string",
+                    "description": "份额观察日 YYYY-MM-DD；默认最近有披露的交易日",
+                },
+                "include_holders": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否拉取定期报告十大持有人中的国家队席位",
+                },
+                "lookback_days": {
+                    "type": "integer",
+                    "default": 12,
+                    "description": "向前寻找披露日的日历天数",
+                },
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "get_national_team_flow",
     },
     {
         "id": "get_market_news",
@@ -565,7 +614,11 @@ CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "submit_review",
         "name": "提交复盘",
-        "description": "对决策复盘，必须标注问题类型（复盘正文请使用中文）",
+        "description": (
+            "对决策复盘，必须标注问题类型（复盘正文请使用中文）。"
+            "lessons 以投资经验为主（kind=investment）；"
+            "工具/能力口径用 kind=agent|system 并带 fingerprint，同指纹原地更新。"
+        ),
         "category": "review",
         "input_schema": {
             "type": "object",
@@ -585,7 +638,24 @@ CAPABILITIES: list[dict[str, Any]] = [
                 "agent_run_id": {"type": "integer"},
                 "create_change_request": {"type": "boolean"},
                 "change_request": {"type": "object"},
-                "lessons": {"type": "array"},
+                "lessons": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": ["investment", "agent", "system"],
+                            },
+                            "fingerprint": {
+                                "type": "string",
+                                "description": "主题指纹如 [usage] get_etf_premium；agent/system 必填以便覆盖",
+                            },
+                            "content": {"type": "string"},
+                        },
+                        "required": ["content"],
+                    },
+                },
             },
             "required": ["issue_type", "content"],
         },
@@ -633,12 +703,25 @@ CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "list_experiences",
         "name": "列出沉淀经验",
-        "description": "读取已沉淀的投资/Agent/系统经验",
+        "description": (
+            "读取沉淀经验。默认仅返回投资经验（中长期判断/仓位/风险）；"
+            "工具用法与能力口径会过时，需传 include_usage=true 或 kind=agent|system。"
+            "使用经验按 fingerprint 原地更新，勿当永久投资结论。"
+        ),
         "category": "review",
         "input_schema": {
             "type": "object",
             "properties": {
-                "kind": {"type": "string"},
+                "kind": {
+                    "type": "string",
+                    "enum": ["investment", "agent", "system"],
+                    "description": "指定类型；与 include_usage 二选一优先",
+                },
+                "include_usage": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "true 时在投资经验后追加 agent/system",
+                },
                 "limit": {"type": "integer", "default": 20},
             },
         },

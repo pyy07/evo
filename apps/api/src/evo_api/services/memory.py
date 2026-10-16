@@ -9,6 +9,7 @@ from evo_api.models.entities import (
     AuditLog,
     ChangeRequest,
     Experience,
+    ExperienceKind,
     InvestmentDecision,
     IssueType,
     Review,
@@ -45,8 +46,19 @@ def memory_summary(db: Session) -> dict[str, Any]:
     for cr in crs:
         cr_by_status[cr.status.value] = cr_by_status.get(cr.status.value, 0) + 1
 
-    experiences = (
-        db.query(Experience).order_by(Experience.id.desc()).limit(20).all()
+    inv_exps = (
+        db.query(Experience)
+        .filter(Experience.kind == ExperienceKind.investment)
+        .order_by(Experience.id.desc())
+        .limit(15)
+        .all()
+    )
+    usage_exps = (
+        db.query(Experience)
+        .filter(Experience.kind.in_([ExperienceKind.agent, ExperienceKind.system]))
+        .order_by(Experience.updated_at.desc(), Experience.id.desc())
+        .limit(10)
+        .all()
     )
     return {
         "investment_memory": {
@@ -55,9 +67,25 @@ def memory_summary(db: Session) -> dict[str, Any]:
             "decision_errors": inv_failures,
             "issue_breakdown": by_issue,
             "recent_experiences": [
-                {"id": e.id, "kind": e.kind.value, "content": e.content} for e in experiences
+                {
+                    "id": e.id,
+                    "kind": e.kind.value,
+                    "fingerprint": e.fingerprint,
+                    "content": e.content,
+                }
+                for e in inv_exps
             ],
         },
+        "usage_experiences": [
+            {
+                "id": e.id,
+                "kind": e.kind.value,
+                "fingerprint": e.fingerprint,
+                "content": e.content,
+                "updated_at": e.updated_at.isoformat() if e.updated_at else None,
+            }
+            for e in usage_exps
+        ],
         "agent_memory": {
             "capability_invocations": audit_total,
             "failed_invocations": audit_fail,

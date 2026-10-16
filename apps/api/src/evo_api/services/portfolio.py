@@ -11,13 +11,15 @@ from evo_api.config import get_settings, load_instruments
 from evo_api.models.entities import (
     AgentRun,
     AuditLog,
-    Settlement,
+    InvestmentDecision,
     Order,
     OrderSide,
     OrderStatus,
     PortfolioAccount,
     PortfolioSnapshot,
     Position,
+    Review,
+    Settlement,
     Trade,
 )
 from evo_api.services import market_session as market_session_svc
@@ -182,12 +184,52 @@ def get_price(symbol: str) -> float:
     raise ValueError(f"报价缺少价格字段：{symbol} → {q}")
 
 
+def _seed_name_map() -> dict[str, str]:
+    out: dict[str, str] = {}
+    kinds = load_instruments().get("kinds") or {}
+    for kind in kinds.values():
+        if not isinstance(kind, dict):
+            continue
+        universe = kind.get("universe") or {}
+        for item in universe.get("seed_codes") or []:
+            if isinstance(item, dict) and item.get("code"):
+                code = "".join(ch for ch in str(item["code"]) if ch.isdigit())[-6:]
+                name = str(item.get("name") or "").strip()
+                if code and name:
+                    out[code] = name
+    return out
+
+
+def resolve_instrument_names(codes: list[str]) -> dict[str, str]:
+    """代码→名称：优先种子池，其次行情快照 name。"""
+    bare: list[str] = []
+    for c in codes:
+        d = "".join(ch for ch in str(c) if ch.isdigit())[-6:]
+        if d:
+            bare.append(d)
+    bare = list(dict.fromkeys(bare))
+    names = dict(_seed_name_map())
+    need = [c for c in bare if c not in names]
+    if need:
+        try:
+            quotes = get_provider().get_market_snapshot(need)
+        except Exception:  # noqa: BLE001
+            quotes = {}
+        for code in need:
+            q = quotes.get(code) or {}
+            name = str(q.get("name") or q.get("名称") or "").strip()
+            if name:
+                names[code] = name
+    return {c: names.get(c, c) for c in bare}
+
+
 def portfolio_view(db: Session) -> dict[str, Any]:
     acct = ensure_account(db)
     settings = get_settings()
     instruments = load_instruments()
     initial_cash = float(instruments.get("default_cash", settings.initial_cash))
     positions = db.query(Position).filter(Position.quantity != 0).all()
+    name_map = resolve_instrument_names([p.symbol for p in positions])
     marked: list[dict[str, Any]] = []
     equity = acct.cash
     unrealized = 0.0
@@ -205,9 +247,11 @@ def portfolio_view(db: Session) -> dict[str, Any]:
         cost_basis += cost
         locked = bought_today_quantity(db, p.symbol)
         sellable = sellable_quantity(db, p.symbol, p.quantity)
+        code = "".join(ch for ch in str(p.symbol) if ch.isdigit())[-6:] or p.symbol
         marked.append(
             {
                 "symbol": p.symbol,
+                "name": name_map.get(code) or p.symbol,
                 "quantity": p.quantity,
                 "sellable_quantity": sellable,
                 "locked_quantity": locked,
@@ -319,6 +363,7 @@ def invocations_for_run(db: Session, run: AgentRun) -> list[dict[str, Any]]:
                 "get_market_breadth",
                 "get_hsgt_flow",
                 "get_etf_premium",
+                "get_national_team_flow",
                 "take_portfolio_snapshot",
                 "settle_day",
                 "get_day_report",
@@ -367,6 +412,9 @@ def desk_today(db: Session) -> dict[str, Any]:
     ]
     trade_by_order = {t.order_id: t for t in trades}
     invocations_by_run = {r.id: invocations_for_run(db, r) for r in runs}
+    name_map = resolve_instrument_names(
+        [o.symbol for o in orders] + [t.symbol for t in trades]
+    )
     return {
         "date": today.isoformat(),
         "runs": [
@@ -398,6 +446,10 @@ def desk_today(db: Session) -> dict[str, Any]:
             {
                 "id": o.id,
                 "symbol": o.symbol,
+                "name": name_map.get(
+                    "".join(ch for ch in str(o.symbol) if ch.isdigit())[-6:] or o.symbol,
+                    o.symbol,
+                ),
                 "side": o.side.value,
                 "quantity": o.quantity,
                 "status": o.status.value,
@@ -412,15 +464,18 @@ def desk_today(db: Session) -> dict[str, Any]:
             }
             for o in orders
         ],
-        "trades": [_trade_item(t) for t in trades],
+        "trades": [_trade_item(t, name_map=name_map) for t in trades],
     }
 
 
-def _trade_item(t: Trade) -> dict[str, Any]:
+def _trade_item(t: Trade, *, name_map: dict[str, str] | None = None) -> dict[str, Any]:
+    code = "".join(ch for ch in str(t.symbol) if ch.isdigit())[-6:] or t.symbol
+    name = (name_map or {}).get(code) or t.symbol
     return {
         "id": t.id,
         "order_id": t.order_id,
         "symbol": t.symbol,
+        "name": name,
         "side": t.side.value,
         "quantity": t.quantity,
         "price": t.price,
@@ -438,14 +493,16 @@ def list_trades(db: Session, *, limit: int = 200, exclude_today: bool = False) -
     limit = max(1, min(int(limit), 500))
     today = _today_cn()
     rows = db.query(Trade).order_by(Trade.id.desc()).limit(limit * 3).all()
-    items: list[dict[str, Any]] = []
+    picked: list[Trade] = []
     for t in rows:
         d = _to_cn_date(t.created_at)
         if exclude_today and d == today:
             continue
-        items.append(_trade_item(t))
-        if len(items) >= limit:
+        picked.append(t)
+        if len(picked) >= limit:
             break
+    name_map = resolve_instrument_names([t.symbol for t in picked])
+    items = [_trade_item(t, name_map=name_map) for t in picked]
     return {"count": len(items), "items": items}
 
 
@@ -832,3 +889,117 @@ def submit_order(
         "snapshot_id": snap.id,
         "portfolio": portfolio_view(db),
     }
+
+
+def _decision_payload(
+    db: Session,
+    d: InvestmentDecision,
+    *,
+    with_invocations: bool = False,
+    with_orders: bool = False,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": d.id,
+        "summary": d.summary,
+        "hypothesis": d.hypothesis,
+        "action_plan": d.action_plan,
+        "usage_notes": d.usage_notes or [],
+        "agent_run_id": d.agent_run_id,
+        "observation_id": d.observation_id,
+        "thesis_id": d.thesis_id,
+        "created_at": d.created_at.isoformat() if d.created_at else None,
+        "trade_date": _to_cn_date(d.created_at).isoformat() if d.created_at else None,
+    }
+    if with_invocations:
+        invocations: list[dict[str, Any]] = []
+        if d.agent_run_id:
+            run = db.get(AgentRun, d.agent_run_id)
+            if run:
+                invocations = invocations_for_run(db, run)
+        payload["invocations"] = invocations
+        payload["invocation_count"] = len(invocations)
+    if with_orders:
+        orders = (
+            db.query(Order)
+            .filter(Order.decision_id == d.id)
+            .order_by(Order.id.asc())
+            .all()
+        )
+        trades = (
+            db.query(Trade)
+            .filter(Trade.order_id.in_([o.id for o in orders] or [-1]))
+            .all()
+        )
+        trade_by_order = {t.order_id: t for t in trades}
+        payload["orders"] = [
+            {
+                "id": o.id,
+                "symbol": o.symbol,
+                "side": o.side.value,
+                "quantity": o.quantity,
+                "status": o.status.value,
+                "reason": o.reason,
+                "created_at": o.created_at.isoformat() if o.created_at else None,
+                "price": trade_by_order[o.id].price if o.id in trade_by_order else None,
+                "commission": (
+                    trade_by_order[o.id].commission if o.id in trade_by_order else None
+                ),
+            }
+            for o in orders
+        ]
+    return payload
+
+
+def list_decisions(db: Session, *, limit: int = 100) -> dict[str, Any]:
+    limit = max(1, min(int(limit), 300))
+    rows = (
+        db.query(InvestmentDecision)
+        .order_by(InvestmentDecision.id.desc())
+        .limit(limit)
+        .all()
+    )
+    items = []
+    for d in rows:
+        item = _decision_payload(db, d, with_invocations=False, with_orders=False)
+        notes = item["usage_notes"] or []
+        item["usage_note_count"] = len(notes)
+        item["preview"] = (d.summary or "")[:160]
+        items.append(item)
+    return {"items": items, "count": len(items)}
+
+
+def get_decision(db: Session, decision_id: int) -> dict[str, Any] | None:
+    d = db.get(InvestmentDecision, decision_id)
+    if not d:
+        return None
+    return _decision_payload(db, d, with_invocations=True, with_orders=True)
+
+
+def _review_payload(r: Review) -> dict[str, Any]:
+    content = r.content or ""
+    return {
+        "id": r.id,
+        "issue_type": r.issue_type.value,
+        "content": content,
+        "preview": content[:200].replace("\n", " ").strip(),
+        "decision_id": r.decision_id,
+        "agent_run_id": r.agent_run_id,
+        "change_request_id": r.change_request_id,
+        "create_change_request": bool(r.create_change_request),
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "trade_date": _to_cn_date(r.created_at).isoformat() if r.created_at else None,
+    }
+
+
+def list_reviews(db: Session, *, limit: int = 100) -> dict[str, Any]:
+    limit = max(1, min(int(limit), 300))
+    rows = db.query(Review).order_by(Review.id.desc()).limit(limit).all()
+    items = [_review_payload(r) for r in rows]
+    return {"items": items, "count": len(items)}
+
+
+def get_review(db: Session, review_id: int) -> dict[str, Any] | None:
+    r = db.get(Review, review_id)
+    if not r:
+        return None
+    return _review_payload(r)

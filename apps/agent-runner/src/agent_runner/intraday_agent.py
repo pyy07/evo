@@ -20,6 +20,7 @@ INTRADAY_CAPABILITY_TOOLS = frozenset(
         "get_market_breadth",
         "get_hsgt_flow",
         "get_etf_premium",
+        "get_national_team_flow",
         "get_market_news",
         "get_announcements",
         "get_macro_digest",
@@ -126,7 +127,9 @@ def run_intraday_agent_loop(
         system_prompt=system_prompt,
         user_message=(
             f"本轮盘中决策。资产类型={stock_type}。\n"
-            "请先 list_experiences 与 get_portfolio；看大盘优先 get_market_overview"
+            "请先 list_experiences（默认投资经验）与 get_portfolio；"
+            "工具口径不明时再 list_experiences(include_usage=true)；"
+            "看大盘优先 get_market_overview"
             "（指数+估值+北向+行业/概念+资金流+涨跌分布）。"
             "突发/情绪可用 get_market_news（大盘快讯；持仓或候选可 scope=stock/both+codes）；"
             "核对披露用 get_announcements；宏观日程用 get_macro_digest（盘中可选）。"

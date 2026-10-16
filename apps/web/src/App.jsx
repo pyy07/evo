@@ -14,6 +14,14 @@ const STATUS_LABEL = {
 
 const SIDE_LABEL = { buy: "买入", sell: "卖出" };
 
+const ISSUE_LABEL = {
+  NoIssue: "无问题",
+  CapabilityGap: "能力缺口",
+  DataGap: "数据缺口",
+  RuleViolation: "规则违反",
+  ProcessIssue: "流程问题",
+};
+
 function money(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return "—";
@@ -139,6 +147,7 @@ function TradeTable({ trades, emptyText }) {
           <th>时间</th>
           <th>方向</th>
           <th>代码</th>
+          <th>名称</th>
           <th>数量</th>
           <th>成交价</th>
           <th>成交额</th>
@@ -154,6 +163,7 @@ function TradeTable({ trades, emptyText }) {
               {SIDE_LABEL[t.side] || t.side}
             </td>
             <td className="sym">{t.symbol}</td>
+            <td>{t.name || "—"}</td>
             <td>{t.quantity}</td>
             <td>{money(t.price)}</td>
             <td>{money(t.amount ?? Number(t.price) * Number(t.quantity))}</td>
@@ -216,7 +226,7 @@ function SettlementTable({ settlements, todayDate }) {
   );
 }
 
-function DeskPage({ desk, busy, onRefresh }) {
+function DeskPage({ desk, busy, onRefresh, onOpenDecision }) {
   const p = desk?.portfolio;
   const today = desk?.today;
   const settlements = desk?.settlements || [];
@@ -224,7 +234,6 @@ function DeskPage({ desk, busy, onRefresh }) {
   const tradesToday = today?.trades || [];
   const tradesHistory = desk?.trades_history || [];
   const openCrHint = desk?.open_cr_count;
-  const [expanded, setExpanded] = useState({});
   const [ledgerTab, setLedgerTab] = useState("today");
 
   const feed = useMemo(() => {
@@ -240,6 +249,7 @@ function DeskPage({ desk, busy, onRefresh }) {
           : "";
       return {
         kind: "decision",
+        decisionId: d.id,
         id: `d-${d.id}`,
         at: d.created_at,
         title: `决策 #${d.id}`,
@@ -249,26 +259,25 @@ function DeskPage({ desk, busy, onRefresh }) {
           .join(" · "),
         usageNotes: notes,
         agentRunId: d.agent_run_id,
-        invocations: d.invocations || [],
+        invocationCount: (d.invocations || []).length,
       };
     });
     const orders = (today?.orders || []).map((o) => ({
       kind: "order",
       id: `o-${o.id}`,
       at: o.created_at,
-      title: `${SIDE_LABEL[o.side] || o.side} ${o.symbol}`,
+      title: `${SIDE_LABEL[o.side] || o.side} ${o.symbol}${o.name ? ` ${o.name}` : ""}`,
       body: `${o.quantity} 份 · ${o.status}${o.price != null ? ` · ${money(o.price)}` : ""}`,
       meta: o.reason || (o.decision_id ? `关联决策 #${o.decision_id}` : ""),
-      invocations: [],
+      decisionId: o.decision_id || null,
     }));
     const trades = (today?.trades || []).map((t) => ({
       kind: "trade",
       id: `t-${t.id}`,
       at: t.created_at,
-      title: `成交 ${SIDE_LABEL[t.side] || t.side} ${t.symbol}`,
+      title: `成交 ${SIDE_LABEL[t.side] || t.side} ${t.symbol}${t.name ? ` ${t.name}` : ""}`,
       body: `${t.quantity} 份 · ${money(t.price)} · 额 ${money(t.amount ?? t.price * t.quantity)}`,
       meta: `佣金 ${money(t.commission)} · 订单 #${t.order_id}`,
-      invocations: [],
     }));
     return [...decisions, ...orders, ...trades].sort((a, b) => String(b.at).localeCompare(String(a.at)));
   }, [today]);
@@ -331,41 +340,55 @@ function DeskPage({ desk, busy, onRefresh }) {
           ) : (
             <div className="feed">
               {feed.map((item) => {
-                const open = !!expanded[item.id];
-                const n = item.invocations?.length || 0;
+                const clickable = item.kind === "decision" && item.decisionId;
                 return (
-                  <article className={`feed-item ${item.kind}`} key={item.id}>
+                  <article
+                    className={`feed-item ${item.kind}${clickable ? " clickable" : ""}`}
+                    key={item.id}
+                    onClick={
+                      clickable
+                        ? () => onOpenDecision?.(item.decisionId)
+                        : undefined
+                    }
+                    onKeyDown={
+                      clickable
+                        ? (e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              onOpenDecision?.(item.decisionId);
+                            }
+                          }
+                        : undefined
+                    }
+                    role={clickable ? "button" : undefined}
+                    tabIndex={clickable ? 0 : undefined}
+                  >
                     <div className="feed-top">
                       <strong>{item.title}</strong>
                       <time>{when(item.at)}</time>
                     </div>
                     <p>{item.body}</p>
                     {item.meta ? <p className="muted">{item.meta}</p> : null}
-                    {item.kind === "decision" && item.usageNotes?.length ? (
-                      <ul className="usage-notes muted">
-                        {item.usageNotes.map((note, i) => (
-                          <li key={`${item.id}-note-${i}`}>
-                            [{note.kind || "other"}
-                            {note.capability_id ? ` · ${note.capability_id}` : ""}]{" "}
-                            {note.content}
-                          </li>
-                        ))}
-                      </ul>
-                    ) : null}
                     {item.kind === "decision" ? (
-                      <>
-                        <button
-                          type="button"
-                          className="linkish inv-toggle"
-                          onClick={() =>
-                            setExpanded((s) => ({ ...s, [item.id]: !s[item.id] }))
-                          }
-                        >
-                          {open ? "收起接口调用" : `查看接口调用（${n}）`}
-                          {item.agentRunId ? ` · run #${item.agentRunId}` : ""}
-                        </button>
-                        {open ? <InvocationList invocations={item.invocations} /> : null}
-                      </>
+                      <p className="muted go-detail">
+                        查看详情
+                        {item.invocationCount
+                          ? ` · ${item.invocationCount} 次接口调用`
+                          : ""}
+                        {item.agentRunId ? ` · run #${item.agentRunId}` : ""} →
+                      </p>
+                    ) : null}
+                    {item.kind === "order" && item.decisionId ? (
+                      <button
+                        type="button"
+                        className="linkish inv-toggle"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onOpenDecision?.(item.decisionId);
+                        }}
+                      >
+                        查看关联决策 #{item.decisionId} →
+                      </button>
                     ) : null}
                   </article>
                 );
@@ -391,6 +414,7 @@ function DeskPage({ desk, busy, onRefresh }) {
               <thead>
                 <tr>
                   <th>代码</th>
+                  <th>名称</th>
                   <th>数量</th>
                   <th>可卖</th>
                   <th>成本</th>
@@ -403,6 +427,7 @@ function DeskPage({ desk, busy, onRefresh }) {
                 {p.positions.map((row) => (
                   <tr key={row.symbol}>
                     <td className="sym">{row.symbol}</td>
+                    <td>{row.name || "—"}</td>
                     <td>{row.quantity}</td>
                     <td>{row.sellable_quantity ?? "—"}</td>
                     <td>{money(row.avg_cost)}</td>
@@ -464,7 +489,335 @@ function DeskPage({ desk, busy, onRefresh }) {
   );
 }
 
-function EvolutionPage({ token, crs, memory, onRefresh }) {
+function BackBar({ label, onBack }) {
+  return (
+    <div className="back-bar">
+      <button type="button" className="linkish" onClick={onBack}>
+        ← {label}
+      </button>
+    </div>
+  );
+}
+
+function DecisionsListPage({ token, onOpen, onBack }) {
+  const [items, setItems] = useState([]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const data = await api("/admin/decisions?limit=200", { token });
+      setItems(data.items || []);
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <section className="panel detail-panel">
+      <BackBar label="返回演进" onBack={onBack} />
+      <h2>
+        全部决策
+        <span>
+          {items.length} 条 ·{" "}
+          <button type="button" className="linkish" onClick={load} disabled={busy}>
+            {busy ? "刷新中" : "刷新"}
+          </button>
+        </span>
+      </h2>
+      {error ? <div className="flash">{error}</div> : null}
+      {items.length === 0 && !busy ? (
+        <div className="empty">还没有决策记录。</div>
+      ) : (
+        <div className="record-list">
+          {items.map((d) => (
+            <button
+              type="button"
+              className="record-row"
+              key={d.id}
+              onClick={() => onOpen(d.id)}
+            >
+              <div className="record-top">
+                <strong>决策 #{d.id}</strong>
+                <time>
+                  {d.trade_date || ""} · {when(d.created_at)}
+                </time>
+              </div>
+              <p>{clip(d.summary || d.preview, 160)}</p>
+              <p className="muted">
+                {d.usage_note_count ? `心得 ${d.usage_note_count} · ` : ""}
+                {d.agent_run_id ? `run #${d.agent_run_id} · ` : ""}
+                查看详情 →
+              </p>
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DecisionDetailPage({ token, decisionId, onBack }) {
+  const [row, setRow] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const data = await api(`/admin/decisions/${decisionId}`, { token });
+      setRow(data);
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }, [token, decisionId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <section className="panel detail-panel">
+      <BackBar label="返回决策列表" onBack={onBack} />
+      {error ? <div className="flash">{error}</div> : null}
+      {busy && !row ? <div className="empty">加载中…</div> : null}
+      {row ? (
+        <>
+          <h2>
+            决策 #{row.id}
+            <span>
+              {row.trade_date || ""} · {when(row.created_at)}
+              {row.agent_run_id ? ` · run #${row.agent_run_id}` : ""}
+            </span>
+          </h2>
+          <div className="detail-block">
+            <h3>摘要</h3>
+            <p className="prose">{row.summary || "—"}</p>
+          </div>
+          {row.hypothesis ? (
+            <div className="detail-block">
+              <h3>假设</h3>
+              <p className="prose">{row.hypothesis}</p>
+            </div>
+          ) : null}
+          {row.action_plan ? (
+            <div className="detail-block">
+              <h3>行动计划</h3>
+              <p className="prose">{row.action_plan}</p>
+            </div>
+          ) : null}
+          <div className="detail-block">
+            <h3>使用心得（{row.usage_notes?.length || 0}）</h3>
+            {(row.usage_notes || []).length === 0 ? (
+              <div className="empty">本轮无 usage_notes。</div>
+            ) : (
+              <ul className="usage-notes">
+                {(row.usage_notes || []).map((note, i) => (
+                  <li key={`note-${i}`}>
+                    <strong>
+                      [{note.kind || "other"}
+                      {note.capability_id ? ` · ${note.capability_id}` : ""}]
+                    </strong>{" "}
+                    {note.content}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <div className="detail-block">
+            <h3>关联订单（{row.orders?.length || 0}）</h3>
+            {(row.orders || []).length === 0 ? (
+              <div className="empty">本决策未下单。</div>
+            ) : (
+              <table className="pos-table trade-table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>方向</th>
+                    <th>代码</th>
+                    <th>数量</th>
+                    <th>状态</th>
+                    <th>成交价</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {row.orders.map((o) => (
+                    <tr key={o.id}>
+                      <td>{when(o.created_at)}</td>
+                      <td className={o.side === "buy" ? "up" : "down"}>
+                        {SIDE_LABEL[o.side] || o.side}
+                      </td>
+                      <td className="sym">{o.symbol}</td>
+                      <td>{o.quantity}</td>
+                      <td>{o.status}</td>
+                      <td>{o.price != null ? money(o.price) : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+          <div className="detail-block">
+            <h3>接口调用（{row.invocations?.length || 0}）</h3>
+            <InvocationList invocations={row.invocations || []} />
+          </div>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+function ReviewsListPage({ token, onOpen, onBack }) {
+  const [items, setItems] = useState([]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const data = await api("/admin/reviews?limit=200", { token });
+      setItems(data.items || []);
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <section className="panel detail-panel">
+      <BackBar label="返回演进" onBack={onBack} />
+      <h2>
+        全部复盘
+        <span>
+          {items.length} 条 ·{" "}
+          <button type="button" className="linkish" onClick={load} disabled={busy}>
+            {busy ? "刷新中" : "刷新"}
+          </button>
+        </span>
+      </h2>
+      {error ? <div className="flash">{error}</div> : null}
+      {items.length === 0 && !busy ? (
+        <div className="empty">还没有复盘记录。</div>
+      ) : (
+        <div className="record-list">
+          {items.map((r) => (
+            <button
+              type="button"
+              className="record-row"
+              key={r.id}
+              onClick={() => onOpen(r.id)}
+            >
+              <div className="record-top">
+                <strong>
+                  复盘 #{r.id}
+                  <span className="badge soft">
+                    {ISSUE_LABEL[r.issue_type] || r.issue_type}
+                  </span>
+                </strong>
+                <time>
+                  {r.trade_date || ""} · {when(r.created_at)}
+                </time>
+              </div>
+              <p>{clip(r.preview || r.content, 180)}</p>
+              <p className="muted">
+                {r.change_request_id ? `CR #${r.change_request_id} · ` : ""}
+                查看全文 →
+              </p>
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ReviewDetailPage({ token, reviewId, onBack, onOpenDecision, onOpenCr }) {
+  const [row, setRow] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const data = await api(`/admin/reviews/${reviewId}`, { token });
+      setRow(data);
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }, [token, reviewId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <section className="panel detail-panel">
+      <BackBar label="返回复盘列表" onBack={onBack} />
+      {error ? <div className="flash">{error}</div> : null}
+      {busy && !row ? <div className="empty">加载中…</div> : null}
+      {row ? (
+        <>
+          <h2>
+            复盘 #{row.id}
+            <span>
+              {ISSUE_LABEL[row.issue_type] || row.issue_type} · {row.trade_date || ""} ·{" "}
+              {when(row.created_at)}
+            </span>
+          </h2>
+          <div className="detail-meta">
+            {row.decision_id ? (
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => onOpenDecision?.(row.decision_id)}
+              >
+                关联决策 #{row.decision_id}
+              </button>
+            ) : null}
+            {row.change_request_id ? (
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => onOpenCr?.()}
+              >
+                关联变更单 #{row.change_request_id}
+              </button>
+            ) : null}
+            {row.agent_run_id ? (
+              <span className="muted">run #{row.agent_run_id}</span>
+            ) : null}
+          </div>
+          <div className="detail-block">
+            <h3>复盘正文</h3>
+            <pre className="review-body">{row.content || "—"}</pre>
+          </div>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+function EvolutionPage({ token, crs, memory, onRefresh, onOpenDecisions, onOpenReviews }) {
   const [rejectingId, setRejectingId] = useState(null);
   const [rejectReason, setRejectReason] = useState("");
   const [error, setError] = useState("");
@@ -620,14 +973,16 @@ function EvolutionPage({ token, crs, memory, onRefresh }) {
       <section className="panel">
         <h2>记忆与经验</h2>
         <div className="mem-grid">
-          <div className="mem-cell">
+          <button type="button" className="mem-cell clickable" onClick={onOpenDecisions}>
             <span className="muted">决策</span>
             <b>{inv.decision_count ?? 0}</b>
-          </div>
-          <div className="mem-cell">
+            <span className="mem-go">查看全部 →</span>
+          </button>
+          <button type="button" className="mem-cell clickable" onClick={onOpenReviews}>
             <span className="muted">复盘</span>
             <b>{inv.review_count ?? 0}</b>
-          </div>
+            <span className="mem-go">查看全部 →</span>
+          </button>
         </div>
         <h3 className="muted">近期经验</h3>
         {lessons.length === 0 ? (
@@ -646,7 +1001,8 @@ function EvolutionPage({ token, crs, memory, onRefresh }) {
 }
 
 export default function App() {
-  const [page, setPage] = useState("desk");
+  // route: desk | evolution | decisions | decision | reviews | review
+  const [route, setRoute] = useState({ name: "desk" });
   const [token, setToken] = useState(
     () => localStorage.getItem("evo_admin_token") || "dev-admin-token",
   );
@@ -657,12 +1013,25 @@ export default function App() {
   const [busy, setBusy] = useState(false);
 
   const saveToken = () => localStorage.setItem("evo_admin_token", token);
+  const pageName = route.name;
+  const navActive =
+    pageName === "desk"
+      ? "desk"
+      : pageName === "decisions" || (pageName === "decision" && route.from !== "desk")
+        ? "decisions"
+        : pageName === "decision" && route.from === "desk"
+          ? "desk"
+          : pageName === "reviews" || pageName === "review"
+            ? "reviews"
+            : pageName === "evolution"
+              ? "evolution"
+              : "desk";
 
   const refresh = useCallback(async () => {
     setBusy(true);
     setError("");
     try {
-      if (page === "desk") {
+      if (pageName === "desk") {
         const d = await api("/admin/desk", { token });
         const c = await api("/admin/change-requests", { token });
         const open = (c.items || []).filter((x) =>
@@ -670,7 +1039,7 @@ export default function App() {
         ).length;
         setDesk({ ...d, open_cr_count: open });
         setCrs(c.items || []);
-      } else {
+      } else if (pageName === "evolution") {
         const [c, m] = await Promise.all([
           api("/admin/change-requests", { token }),
           api("/admin/memory", { token }),
@@ -683,11 +1052,75 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [token, page]);
+  }, [token, pageName]);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  const goDesk = () => setRoute({ name: "desk" });
+  const goEvolution = () => setRoute({ name: "evolution" });
+  const goDecisions = () => setRoute({ name: "decisions" });
+  const goReviews = () => setRoute({ name: "reviews" });
+  const openDecision = (id) => setRoute({ name: "decision", id, from: pageName });
+  const openReview = (id) => setRoute({ name: "review", id, from: pageName });
+
+  let body = null;
+  if (pageName === "desk") {
+    body = (
+      <DeskPage
+        desk={desk}
+        busy={busy}
+        onRefresh={refresh}
+        onOpenDecision={openDecision}
+      />
+    );
+  } else if (pageName === "evolution") {
+    body = (
+      <EvolutionPage
+        token={token}
+        crs={crs}
+        memory={memory}
+        onRefresh={refresh}
+        onOpenDecisions={goDecisions}
+        onOpenReviews={goReviews}
+      />
+    );
+  } else if (pageName === "decisions") {
+    body = (
+      <DecisionsListPage
+        token={token}
+        onOpen={openDecision}
+        onBack={goEvolution}
+      />
+    );
+  } else if (pageName === "decision") {
+    body = (
+      <DecisionDetailPage
+        token={token}
+        decisionId={route.id}
+        onBack={() =>
+          setRoute({
+            name: route.from === "desk" ? "desk" : "decisions",
+          })
+        }
+      />
+    );
+  } else if (pageName === "reviews") {
+    body = (
+      <ReviewsListPage token={token} onOpen={openReview} onBack={goEvolution} />
+    );
+  } else if (pageName === "review") {
+    body = (
+      <ReviewDetailPage
+        token={token}
+        reviewId={route.id}
+        onBack={() => setRoute({ name: "reviews" })}
+        onOpenDecision={openDecision}
+        onOpenCr={goEvolution}
+      />
+    );
+  }
 
   return (
     <div className="shell">
@@ -695,20 +1128,34 @@ export default function App() {
         <div>
           <p className="kicker">Paper Desk</p>
           <h1>Evo 监督台</h1>
-          <p className="sub">持仓 · 盈亏 · 当日决策与操作</p>
+          <p className="sub">持仓 · 盈亏 · 决策与复盘</p>
         </div>
         <nav className="nav">
           <button
             type="button"
-            className={page === "desk" ? "nav-active" : ""}
-            onClick={() => setPage("desk")}
+            className={navActive === "desk" ? "nav-active" : ""}
+            onClick={goDesk}
           >
             台面
           </button>
           <button
             type="button"
-            className={page === "evolution" ? "nav-active" : ""}
-            onClick={() => setPage("evolution")}
+            className={navActive === "decisions" ? "nav-active" : ""}
+            onClick={goDecisions}
+          >
+            决策
+          </button>
+          <button
+            type="button"
+            className={navActive === "reviews" ? "nav-active" : ""}
+            onClick={goReviews}
+          >
+            复盘
+          </button>
+          <button
+            type="button"
+            className={navActive === "evolution" ? "nav-active" : ""}
+            onClick={goEvolution}
           >
             演进
           </button>
@@ -730,12 +1177,7 @@ export default function App() {
       </header>
 
       {error ? <div className="flash">{error}</div> : null}
-
-      {page === "desk" ? (
-        <DeskPage desk={desk} busy={busy} onRefresh={refresh} />
-      ) : (
-        <EvolutionPage token={token} crs={crs} memory={memory} onRefresh={refresh} />
-      )}
+      {body}
     </div>
   );
 }
