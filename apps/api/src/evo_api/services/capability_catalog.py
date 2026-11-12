@@ -103,7 +103,11 @@ CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "screen_market",
         "name": "全市场筛选",
-        "description": "按资产类型筛选候选（ETF/可转债/个股），按涨跌幅绝对值排序",
+        "description": (
+            "按资产类型筛选候选（ETF/可转债/个股），按涨跌幅绝对值排序。"
+            "ETF 候选批量回填跟踪指数估值（pe_ttm/pb/股息率/分位）；"
+            "快照 pe_ttm/pb=0 置 null，禁止当无估值或极低估。"
+        ),
         "category": "market",
         "input_schema": {
             "type": "object",
@@ -127,13 +131,19 @@ CAPABILITIES: list[dict[str, Any]] = [
         "description": (
             "盘中大盘综合快照：主要指数、沪深300估值、北向资金、行业/概念涨跌、"
             "行业资金流向、全市场涨跌分布。分项失败会降级保留其余字段。"
-            "概念榜已过滤涨停/打板等统计标签；资金流为压缩字段，完整分项请调 get_board_fund_flow。"
+            "行业/概念主榜默认 min_member_count=5，小样本不回填主榜（见 raw_leaders）；"
+            "breadth 与 get_market_breadth 同一次取数（含 as_of 与涨跌停聚合）。"
         ),
         "category": "market",
         "input_schema": {
             "type": "object",
             "properties": {
                 "top_n": {"type": "integer", "default": 8, "description": "行业/概念/资金流各取前 N"},
+                "min_member_count": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "主榜最少成分家数；不足不回填小样本",
+                },
             },
         },
         "output_schema": {"type": "object"},
@@ -194,10 +204,14 @@ CAPABILITIES: list[dict[str, Any]] = [
         "id": "get_index_valuation",
         "name": "指数/ETF估值",
         "description": (
-            "指数或宽基 ETF 估值：优先中证 PE/股息率与近期窗口 PE 分位；"
-            "返回 pe_percentile_window_start/end。name 优先本地映射（含 000015 红利指数等），"
-            "东财 ulist 失败时 degraded=true/ulist_status=unavailable，不把代码当名称。"
-            "pb_status=unavailable；pe_percentile_1y/3y 无同源时长为 null，勿当作全历史分位。"
+            "指数或宽基 ETF 估值：pe/pe_percentile 为中证近期静态 PE 窗口；"
+            "pe_ttm 与 pe_percentile_1y/3y/5y 为中证滚动市盈率历史分位（pe_percentile_long_basis="
+            "csi_pe_ttm_history），含窗口起止与 sample_size。"
+            "dy_percentile_1y/3y/5y 与 dy_series 来自中证 indicator 股息率序列；"
+            "pb 来自中证主指数当日快照（pb_status=ok 时可用，覆盖有限如 000300/000015）；"
+            "pb_percentile_* 暂无公开同源，保持 unavailable，勿用短窗冒充。"
+            "红利指数附 caveat：勿单用 PE 分位作高估判据。"
+            "name 优先本地映射；东财 ulist 失败标 degraded，不把代码当名称。"
         ),
         "category": "market",
         "input_schema": {
@@ -217,9 +231,22 @@ CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "get_market_breadth",
         "name": "全市场涨跌分布",
-        "description": "A 股涨跌家数与涨跌幅分布直方图（东财 ZDFenBu + 上证/深证涨跌家数）",
+        "description": (
+            "A 股涨跌家数与涨跌幅分布直方图（东财 ZDFenBu + 上证/深证涨跌家数）。"
+            "含 as_of、limit_up_total/limit_down_total 等聚合；"
+            "每次调用落盘当日快照，days>1 返回本地累积 history（无公开回溯时可为 partial）。"
+        ),
         "category": "market",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "default": 1,
+                    "description": "历史天数（>1 暂无公开回溯源）",
+                },
+            },
+        },
         "output_schema": {"type": "object"},
         "permission": "agent",
         "implementation": "get_market_breadth",
@@ -247,6 +274,8 @@ CAPABILITIES: list[dict[str, Any]] = [
             "份额字段 share_change_status=t1_only（as_of 为最近披露日），"
             "share_usable_for_intraday=false，不可当作盘中当日申赎结论；"
             "estimated_net_flow≈份额变动×净值（元）。"
+            "share_direction 按跟踪指数汇总同向性；|share_change_pct|≥2% 列入 abnormal，"
+            "cause/announcement 来自巨潮或东财基金公告标题（折算/合并/转托管关键词）。"
         ),
         "category": "market",
         "input_schema": {
@@ -387,7 +416,9 @@ CAPABILITIES: list[dict[str, Any]] = [
         "name": "宏观日程与联播摘要",
         "description": (
             "华尔街见闻宏观日历（重要性过滤）+ 可选央视新闻联播标题。"
-            "盘后/中长期判断用；calendar 含实际/预期/前值，cctv 仅标题摘要。"
+            "默认按 importance 降序、同级按时间升序；importance≥3 优先纳入，"
+            "截断时返回 calendar_meta.truncated/total_count/next_cursor，禁止静默丢高重要性事件。"
+            "slim=true 仅保留核心字段；kind=data|event 可分流。"
         ),
         "category": "news",
         "input_schema": {
@@ -416,6 +447,26 @@ CAPABILITIES: list[dict[str, Any]] = [
                     "type": "boolean",
                     "default": True,
                     "description": "是否附带新闻联播标题",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 40,
+                    "description": "日历条数上限；超额优先保留 importance≥3",
+                },
+                "slim": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "仅返回 time/country/title/importance/actual_status/actual",
+                },
+                "order_by": {
+                    "type": "string",
+                    "enum": ["importance_desc_time_asc", "time_asc"],
+                    "default": "importance_desc_time_asc",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["data", "event"],
+                    "description": "仅数据类或事件类",
                 },
             },
         },
@@ -584,7 +635,11 @@ CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "submit_order",
         "name": "提交模拟订单",
-        "description": "纸面交易下单（模拟成交）",
+        "description": (
+            "纸面交易下单（模拟成交）。每笔必须带 rationale（依据）、confidence（0–100）、"
+            "verify（结构化验证：horizon_days/metric/op/target/summary；"
+            "metric=return_vs_cost|return_vs_benchmark|still_held）。缺一拒单。"
+        ),
         "category": "execution",
         "input_schema": {
             "type": "object",
@@ -592,14 +647,101 @@ CAPABILITIES: list[dict[str, Any]] = [
                 "symbol": {"type": "string"},
                 "side": {"type": "string", "enum": ["buy", "sell"]},
                 "quantity": {"type": "number"},
+                "rationale": {"type": "string", "description": "决策依据（简体中文）"},
+                "confidence": {
+                    "type": "number",
+                    "description": "信心指数 0–100",
+                },
+                "verify": {
+                    "type": "object",
+                    "description": "结构化验证条件",
+                    "properties": {
+                        "horizon_days": {"type": "integer"},
+                        "metric": {
+                            "type": "string",
+                            "enum": [
+                                "return_vs_cost",
+                                "return_vs_benchmark",
+                                "still_held",
+                            ],
+                        },
+                        "op": {
+                            "type": "string",
+                            "enum": ["gte", "lte", "gt", "lt"],
+                        },
+                        "target": {"type": "number"},
+                        "benchmark": {"type": "string"},
+                        "summary": {"type": "string"},
+                    },
+                    "required": [
+                        "horizon_days",
+                        "metric",
+                        "op",
+                        "target",
+                        "summary",
+                    ],
+                },
                 "decision_id": {"type": "integer"},
                 "agent_run_id": {"type": "integer"},
             },
-            "required": ["symbol", "side", "quantity"],
+            "required": [
+                "symbol",
+                "side",
+                "quantity",
+                "rationale",
+                "confidence",
+                "verify",
+            ],
         },
         "output_schema": {"type": "object"},
         "permission": "agent",
         "implementation": "submit_order",
+    },
+    {
+        "id": "list_trade_verifications",
+        "name": "列出成交验证任务",
+        "description": (
+            "按状态列出带验证条件的成交。status=due 为到期待验（含 live_eval 客观指标）；"
+            "pending/verified/all 亦可。复盘时先拉 due 再 submit_trade_verification。"
+        ),
+        "category": "review",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["due", "pending", "verified", "all"],
+                    "default": "due",
+                },
+                "limit": {"type": "integer", "default": 50},
+            },
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "list_trade_verifications",
+    },
+    {
+        "id": "submit_trade_verification",
+        "name": "提交成交验证结论",
+        "description": (
+            "对到期成交写验证结论（仅盘后）。系统会重算客观指标写入 verify_eval；"
+            "outcome 为结论，lesson 可沉淀；skip=true 标记跳过。"
+        ),
+        "category": "review",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "trade_id": {"type": "integer"},
+                "outcome": {"type": "string"},
+                "lesson": {"type": "string"},
+                "review_id": {"type": "integer"},
+                "skip": {"type": "boolean"},
+            },
+            "required": ["trade_id", "outcome"],
+        },
+        "output_schema": {"type": "object"},
+        "permission": "agent",
+        "implementation": "submit_trade_verification",
     },
     {
         "id": "get_portfolio",

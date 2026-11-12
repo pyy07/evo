@@ -136,6 +136,15 @@ function InvocationList({ invocations }) {
   );
 }
 
+function verifyLabel(t) {
+  if (!t?.verify_spec && t?.verify_status == null) return "—";
+  if (t.is_due) return "待验·到期";
+  if (t.verify_status === "verified") return "已验收";
+  if (t.verify_status === "skipped") return "已跳过";
+  if (t.verify_status === "pending") return "待验";
+  return t.verify_status || "—";
+}
+
 function TradeTable({ trades, emptyText }) {
   if (!trades?.length) {
     return <div className="empty">{emptyText}</div>;
@@ -150,14 +159,15 @@ function TradeTable({ trades, emptyText }) {
           <th>名称</th>
           <th>数量</th>
           <th>成交价</th>
-          <th>成交额</th>
-          <th>佣金</th>
+          <th>信心</th>
+          <th>验证</th>
+          <th>依据 / 条件</th>
           <th>订单</th>
         </tr>
       </thead>
       <tbody>
         {trades.map((t) => (
-          <tr key={t.id}>
+          <tr key={t.id} className={t.is_due ? "due-row" : undefined}>
             <td>{when(t.created_at)}</td>
             <td className={t.side === "buy" ? "up" : "down"}>
               {SIDE_LABEL[t.side] || t.side}
@@ -166,8 +176,17 @@ function TradeTable({ trades, emptyText }) {
             <td>{t.name || "—"}</td>
             <td>{t.quantity}</td>
             <td>{money(t.price)}</td>
-            <td>{money(t.amount ?? Number(t.price) * Number(t.quantity))}</td>
-            <td>{money(t.commission)}</td>
+            <td>{t.confidence != null ? t.confidence : "—"}</td>
+            <td title={t.verify_due_date ? `到期 ${t.verify_due_date}` : ""}>
+              {verifyLabel(t)}
+            </td>
+            <td className="trade-evidence">
+              <div className="trade-rationale">{t.rationale || "—"}</div>
+              <div className="trade-verify-sum">
+                {t.verify_spec?.summary ||
+                  (t.verify_outcome ? `结论：${t.verify_outcome}` : "")}
+              </div>
+            </td>
             <td>#{t.order_id}</td>
           </tr>
         ))}
@@ -223,6 +242,225 @@ function SettlementTable({ settlements, todayDate }) {
         ))}
       </tbody>
     </table>
+  );
+}
+
+function buildEquitySeries(settlements, portfolio, todayDate) {
+  const byDate = new Map();
+  for (const s of settlements || []) {
+    if (!s?.trade_date) continue;
+    byDate.set(s.trade_date, {
+      date: s.trade_date,
+      equity: Number(s.close_equity),
+      openEquity: Number(s.open_equity),
+      dayPnl: Number(s.day_pnl),
+      dayPnlPct: Number(s.day_pnl_pct),
+      live: false,
+    });
+  }
+  const liveEquity = Number(portfolio?.equity);
+  if (todayDate && Number.isFinite(liveEquity)) {
+    const existing = byDate.get(todayDate);
+    if (!existing) {
+      byDate.set(todayDate, {
+        date: todayDate,
+        equity: liveEquity,
+        openEquity: Number(portfolio?.day_start_equity),
+        dayPnl: Number(portfolio?.day_pnl),
+        dayPnlPct: Number(portfolio?.day_pnl_pct),
+        live: true,
+      });
+    }
+  }
+  return [...byDate.values()]
+    .filter((p) => Number.isFinite(p.equity))
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+}
+
+function EquityCurve({ settlements, portfolio, todayDate }) {
+  const [hover, setHover] = useState(null);
+  const series = useMemo(
+    () => buildEquitySeries(settlements, portfolio, todayDate),
+    [settlements, portfolio, todayDate],
+  );
+
+  const stats = useMemo(() => {
+    if (series.length < 1) return null;
+    const first = series[0].equity;
+    const last = series[series.length - 1].equity;
+    const change = last - first;
+    const changePct = first ? (change / first) * 100 : 0;
+    let peak = series[0].equity;
+    let maxDd = 0;
+    let maxDdDate = series[0].date;
+    for (const pt of series) {
+      peak = Math.max(peak, pt.equity);
+      const dd = peak > 0 ? ((pt.equity - peak) / peak) * 100 : 0;
+      if (dd < maxDd) {
+        maxDd = dd;
+        maxDdDate = pt.date;
+      }
+    }
+    return { first, last, change, changePct, maxDd, maxDdDate, n: series.length };
+  }, [series]);
+
+  if (series.length < 2) {
+    return (
+      <section className="panel equity-panel">
+        <h2>
+          盈亏曲线
+          <span>需至少 2 个交易日清算（或清算 + 今日盯市）</span>
+        </h2>
+        <div className="empty">
+          {series.length === 1
+            ? `目前仅有 ${series[0].date} 一点权益数据，盘后再清算几日即可看到曲线。`
+            : "还没有清算记录，无法绘制资产曲线。"}
+        </div>
+      </section>
+    );
+  }
+
+  const W = 720;
+  const H = 220;
+  const pad = { t: 16, r: 16, b: 28, l: 58 };
+  const innerW = W - pad.l - pad.r;
+  const innerH = H - pad.t - pad.b;
+  const vals = series.map((p) => p.equity);
+  const minV = Math.min(...vals);
+  const maxV = Math.max(...vals);
+  const span = Math.max(maxV - minV, 1);
+  const yMin = minV - span * 0.08;
+  const yMax = maxV + span * 0.08;
+  const xAt = (i) => pad.l + (series.length === 1 ? innerW / 2 : (i / (series.length - 1)) * innerW);
+  const yAt = (v) => pad.t + ((yMax - v) / (yMax - yMin)) * innerH;
+  const line = series.map((p, i) => `${xAt(i)},${yAt(p.equity)}`).join(" ");
+  const area = `${xAt(0)},${yAt(yMin)} ${line} ${xAt(series.length - 1)},${yAt(yMin)}`;
+  const gridYs = [0, 0.25, 0.5, 0.75, 1].map((t) => yMin + (yMax - yMin) * t);
+  const tip = hover != null ? series[hover] : series[series.length - 1];
+
+  return (
+    <section className="panel equity-panel">
+      <h2>
+        盈亏曲线
+        <span>
+          {series[0].date} → {series[series.length - 1].date}
+          {series.some((p) => p.live) ? " · 含今日盯市" : " · 日终清算"}
+        </span>
+      </h2>
+      <div className="equity-summary">
+        <div>
+          <label>区间变动</label>
+          <div className={`equity-stat ${pnlClass(stats.change)}`}>
+            {stats.change > 0 ? "+" : ""}
+            {money(stats.change)}
+            <small> {pct(stats.changePct)}</small>
+          </div>
+        </div>
+        <div>
+          <label>最新权益</label>
+          <div className="equity-stat">{money(stats.last)}</div>
+        </div>
+        <div>
+          <label>最大回撤</label>
+          <div className={`equity-stat ${pnlClass(stats.maxDd)}`}>
+            {pct(stats.maxDd)}
+            <small> @ {stats.maxDdDate}</small>
+          </div>
+        </div>
+        <div>
+          <label>样本</label>
+          <div className="equity-stat">{stats.n} 日</div>
+        </div>
+      </div>
+      <div className="equity-chart-wrap">
+        <svg
+          className="equity-chart"
+          viewBox={`0 0 ${W} ${H}`}
+          role="img"
+          aria-label="每日收盘权益曲线"
+          onMouseLeave={() => setHover(null)}
+        >
+          <defs>
+            <linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#c44924" stopOpacity="0.28" />
+              <stop offset="100%" stopColor="#c44924" stopOpacity="0.02" />
+            </linearGradient>
+          </defs>
+          {gridYs.map((v) => (
+            <g key={v}>
+              <line
+                x1={pad.l}
+                x2={W - pad.r}
+                y1={yAt(v)}
+                y2={yAt(v)}
+                className="equity-grid"
+              />
+              <text x={pad.l - 8} y={yAt(v) + 3} className="equity-axis" textAnchor="end">
+                {(v / 10000).toFixed(1)}万
+              </text>
+            </g>
+          ))}
+          <polygon points={area} fill="url(#equityFill)" />
+          <polyline points={line} className="equity-line" fill="none" />
+          {series.map((p, i) => (
+            <circle
+              key={p.date}
+              cx={xAt(i)}
+              cy={yAt(p.equity)}
+              r={hover === i ? 4.5 : 2.8}
+              className={`equity-dot${p.live ? " live" : ""}${hover === i ? " active" : ""}`}
+              onMouseEnter={() => setHover(i)}
+            />
+          ))}
+          {/* 透明命中区，便于 hover */}
+          {series.map((p, i) => (
+            <rect
+              key={`hit-${p.date}`}
+              x={xAt(i) - innerW / series.length / 2}
+              y={pad.t}
+              width={Math.max(innerW / series.length, 12)}
+              height={innerH}
+              fill="transparent"
+              onMouseEnter={() => setHover(i)}
+            />
+          ))}
+          <text x={pad.l} y={H - 8} className="equity-axis">
+            {series[0].date.slice(5)}
+          </text>
+          <text x={W - pad.r} y={H - 8} className="equity-axis" textAnchor="end">
+            {series[series.length - 1].date.slice(5)}
+          </text>
+        </svg>
+        <div className="equity-tip">
+          <strong>
+            {tip.date}
+            {tip.live ? " · 盯市" : ""}
+          </strong>
+          <span>权益 {money(tip.equity)}</span>
+          <span className={pnlClass(tip.dayPnl)}>
+            当日 {Number(tip.dayPnl) > 0 ? "+" : ""}
+            {money(tip.dayPnl)}
+            {Number.isFinite(tip.dayPnlPct) ? ` (${pct(tip.dayPnlPct)})` : ""}
+          </span>
+        </div>
+      </div>
+      <div className="equity-bars" aria-hidden={series.length > 40}>
+        {series.map((p) => {
+          const mag = Math.max(...series.map((x) => Math.abs(Number(x.dayPnl) || 0)), 1);
+          const h = Math.min(100, (Math.abs(Number(p.dayPnl) || 0) / mag) * 100);
+          return (
+            <div
+              key={`bar-${p.date}`}
+              className={`equity-bar ${pnlClass(p.dayPnl)}${hover != null && series[hover]?.date === p.date ? " active" : ""}`}
+              style={{ height: `${Math.max(h, 4)}%` }}
+              title={`${p.date} ${money(p.dayPnl)}`}
+              onMouseEnter={() => setHover(series.findIndex((x) => x.date === p.date))}
+            />
+          );
+        })}
+      </div>
+      <p className="muted equity-legend">上：日终权益 · 下：每日盈亏柱（红涨绿跌）</p>
+    </section>
   );
 }
 
@@ -324,6 +562,12 @@ function DeskPage({ desk, busy, onRefresh, onOpenDecision }) {
         </div>
       </section>
 
+      <EquityCurve
+        settlements={settlements}
+        portfolio={p}
+        todayDate={today?.date}
+      />
+
       <div className="desk-grid">
         <section className="panel">
           <h2>
@@ -418,9 +662,11 @@ function DeskPage({ desk, busy, onRefresh, onOpenDecision }) {
                   <th>数量</th>
                   <th>可卖</th>
                   <th>成本</th>
+                  <th>昨收</th>
                   <th>现价</th>
                   <th>市值</th>
-                  <th>盈亏</th>
+                  <th>当日盈亏</th>
+                  <th>浮动盈亏</th>
                 </tr>
               </thead>
               <tbody>
@@ -431,8 +677,12 @@ function DeskPage({ desk, busy, onRefresh, onOpenDecision }) {
                     <td>{row.quantity}</td>
                     <td>{row.sellable_quantity ?? "—"}</td>
                     <td>{money(row.avg_cost)}</td>
+                    <td>{row.prev_close != null ? money(row.prev_close) : "—"}</td>
                     <td>{money(row.mark_price)}</td>
                     <td>{money(row.market_value)}</td>
+                    <td>
+                      <Pnl value={row.day_pnl} withPct={row.day_pnl_pct} />
+                    </td>
                     <td>
                       <Pnl value={row.unrealized_pnl} withPct={row.unrealized_pnl_pct} />
                     </td>

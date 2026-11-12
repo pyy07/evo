@@ -338,6 +338,164 @@ button.linkish {
   overflow-x: auto;
 }
 
+.equity-panel {
+  margin-bottom: 1.25rem;
+}
+
+.equity-summary {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.75rem;
+  margin-bottom: 0.85rem;
+}
+
+.equity-summary label {
+  display: block;
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--slate);
+  margin-bottom: 0.2rem;
+}
+
+.equity-stat {
+  font-family: Fraunces, "Noto Serif SC", serif;
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.equity-stat.up {
+  color: var(--up);
+}
+
+.equity-stat.down {
+  color: var(--down);
+}
+
+.equity-stat.flat {
+  color: var(--ink);
+}
+
+.equity-stat small {
+  font-family: "Noto Sans SC", sans-serif;
+  font-size: 0.72rem;
+  font-weight: 500;
+  opacity: 0.85;
+}
+
+.equity-chart-wrap {
+  position: relative;
+}
+
+.equity-chart {
+  width: 100%;
+  height: auto;
+  display: block;
+  background: linear-gradient(180deg, #faf6ec 0%, #fffdf8 100%);
+  border: 1px solid var(--rule);
+}
+
+.equity-grid {
+  stroke: var(--rule);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+}
+
+.equity-axis {
+  fill: var(--slate);
+  font-size: 10px;
+  font-family: "Noto Sans SC", sans-serif;
+}
+
+.equity-line {
+  stroke: var(--stamp);
+  stroke-width: 2.2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.equity-dot {
+  fill: var(--stamp);
+  stroke: #fffdf8;
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+
+.equity-dot.live {
+  fill: var(--amber);
+}
+
+.equity-dot.active {
+  fill: var(--ink);
+}
+
+.equity-tip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.1rem;
+  margin-top: 0.55rem;
+  font-size: 0.88rem;
+  color: var(--ink-soft);
+}
+
+.equity-tip strong {
+  color: var(--ink);
+}
+
+.equity-tip .up {
+  color: var(--up);
+}
+
+.equity-tip .down {
+  color: var(--down);
+}
+
+.equity-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 48px;
+  margin-top: 0.65rem;
+  padding: 0 0.15rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.equity-bar {
+  flex: 1 1 0;
+  min-width: 2px;
+  border-radius: 1px 1px 0 0;
+  opacity: 0.75;
+  transition: opacity 0.12s ease;
+}
+
+.equity-bar.up {
+  background: var(--up);
+}
+
+.equity-bar.down {
+  background: var(--down);
+}
+
+.equity-bar.flat {
+  background: var(--rule);
+}
+
+.equity-bar.active {
+  opacity: 1;
+  outline: 1px solid var(--ink);
+}
+
+.equity-legend {
+  margin: 0.45rem 0 0;
+  font-size: 0.78rem;
+}
+
+@media (max-width: 820px) {
+  .equity-summary {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
 .tabs {
   display: flex;
   gap: 0.35rem;
@@ -395,6 +553,23 @@ button.linkish {
   margin-top: 1.25rem;
 }
 
+.trade-table .trade-evidence {
+  max-width: 18rem;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  text-align: left;
+}
+.trade-table .trade-rationale {
+  white-space: normal;
+}
+.trade-table .trade-verify-sum {
+  margin-top: 0.2rem;
+  opacity: 0.72;
+  white-space: normal;
+}
+.trade-table tr.due-row td {
+  background: color-mix(in srgb, var(--accent, #c45c26) 10%, transparent);
+}
 .trade-table .up {
   color: var(--up);
   font-weight: 600;

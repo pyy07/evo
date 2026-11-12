@@ -43,13 +43,21 @@ def _require(payload: dict[str, Any], key: str) -> Any:
 
 
 def _market_soft(fn, fallback: dict[str, Any]) -> dict[str, Any]:
-    """东财等分项失败时返回降级结果，避免聚合/板块能力整包 502。"""
+    """行情分项失败时返回降级结果，避免整包 500/502。
+
+    除 MarketDataError 外也吞掉意外 TypeError/RuntimeError（例如包未热更导致签名不匹配）。
+    """
     try:
         data = fn()
         return data if isinstance(data, dict) else {"result": data}
     except MarketDataError as exc:
         out = dict(fallback)
         out["error"] = str(exc)
+        out["degraded"] = True
+        return out
+    except Exception as exc:  # noqa: BLE001
+        out = dict(fallback)
+        out["error"] = f"{type(exc).__name__}: {exc}"
         out["degraded"] = True
         return out
 
@@ -238,7 +246,10 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
 
     if impl == "get_market_overview":
         return _market_soft(
-            lambda: get_provider().get_market_overview(top_n=int(payload.get("top_n") or 8)),
+            lambda: get_provider().get_market_overview(
+                top_n=int(payload.get("top_n") or 8),
+                min_member_count=int(payload.get("min_member_count") or 5),
+            ),
             {
                 "as_of": datetime.now().isoformat(timespec="seconds"),
                 "indices": [],
@@ -287,8 +298,17 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
 
     if impl == "get_market_breadth":
         return _market_soft(
-            lambda: get_provider().get_market_breadth(),
-            {"up": 0, "down": 0, "flat": 0, "total": 0, "histogram": []},
+            lambda: get_provider().get_market_breadth(days=int(payload.get("days") or 1)),
+            {
+                "up": 0,
+                "down": 0,
+                "flat": 0,
+                "total": 0,
+                "histogram": [],
+                "as_of": None,
+                "limit_up_total": None,
+                "limit_down_total": None,
+            },
         )
 
     if impl == "get_hsgt_flow":
@@ -375,6 +395,8 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
         if include_cctv is None:
             include_cctv = True
         country = payload.get("country")
+        slim = payload.get("slim")
+        kind = payload.get("kind")
         return _market_soft(
             lambda: get_provider().get_macro_digest(
                 days_ahead=int(payload.get("days_ahead") or 7),
@@ -382,10 +404,15 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
                 country=str(country) if country else None,
                 min_importance=int(payload.get("min_importance") or 2),
                 include_cctv=bool(include_cctv),
+                limit=int(payload["limit"]) if payload.get("limit") is not None else 40,
+                slim=bool(slim) if slim is not None else False,
+                order_by=str(payload.get("order_by") or "importance_desc_time_asc"),
+                kind=str(kind) if kind else None,
             ),
             {
                 "window": {},
                 "calendar": [],
+                "calendar_meta": {"truncated": False},
                 "cctv": [],
                 "degraded": True,
                 "gaps": ["宏观摘要上游失败，已降级"],
@@ -500,6 +527,31 @@ def _dispatch(db: Session, impl: str, payload: dict[str, Any]) -> dict[str, Any]
             quantity=float(_require(payload, "quantity")),
             decision_id=payload.get("decision_id"),
             agent_run_id=payload.get("agent_run_id"),
+            rationale=payload.get("rationale"),
+            confidence=payload.get("confidence"),
+            verify=payload.get("verify"),
+        )
+
+    if impl == "list_trade_verifications":
+        from evo_api.services import trade_verify as trade_verify_svc
+
+        return trade_verify_svc.list_trade_verifications(
+            db,
+            status=str(payload.get("status") or "due"),
+            limit=int(payload.get("limit") or 50),
+        )
+
+    if impl == "submit_trade_verification":
+        from evo_api.services import trade_verify as trade_verify_svc
+
+        require_review_window()
+        return trade_verify_svc.submit_trade_verification(
+            db,
+            trade_id=int(_require(payload, "trade_id")),
+            outcome=str(_require(payload, "outcome")),
+            lesson=payload.get("lesson"),
+            review_id=payload.get("review_id"),
+            skip=bool(payload.get("skip")),
         )
 
     if impl == "get_portfolio":

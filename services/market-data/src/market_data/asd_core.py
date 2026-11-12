@@ -675,6 +675,213 @@ def index_valuation(index_code):
     return _official_frame(rows, ["date", "index_code"], "csi", response.url)
 
 
+# 中证官网 SPA（/csindex-home）：滚动市盈率历史 + 主指数当日估值快照（含 PB）
+_CSI_HOME = "https://www.csindex.com.cn/csindex-home"
+_CSI_HOME_TTL_HISTORY = 3600.0
+_CSI_HOME_TTL_SNAPSHOT = 1800.0
+_CSI_CACHE: dict[str, tuple[float, Any]] = {}
+
+# data-service/indexValuation 仅覆盖少数主指数；用英文名映射（中文名编码不稳）
+_CSI_SNAPSHOT_EN_TO_CODE = {
+    "CSI 300": "000300",
+    "SSE Dividend": "000015",
+    "SSE 50": "000016",
+    "CSI 500": "000905",
+    "CSI Dividend": "000922",
+    "SSE Index": "000001",
+    "SSE 180": "000010",
+    "SSE 380": "000009",
+}
+
+
+def _csi_home_cached(key: str, ttl: float, loader):
+    now = time.time()
+    hit = _CSI_CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    value = loader()
+    _CSI_CACHE[key] = (now, value)
+    return value
+
+
+def _csi_home_get(path: str, params=None) -> dict[str, Any]:
+    url = f"{_CSI_HOME}{path}"
+    response = _official_get(url, params=params, referer="https://www.csindex.com.cn/")
+    payload = _v39_json(response)
+    if str(payload.get("code")) != "200":
+        raise RuntimeError(
+            f"中证接口失败 {path}: {payload.get('msg') or payload.get('message') or payload}"
+        )
+    return payload
+
+
+def index_pe_ttm_history(index_code: str) -> list[dict[str, Any]]:
+    """中证滚动市盈率日序列（官网字段名 peg，实为 PE-TTM）。
+
+    来源：/csindex-home/perf/indexCsiDsPe。不含 PB；不是静态 PE。
+    """
+    index_code = _official_code(index_code)
+
+    def _load() -> list[dict[str, Any]]:
+        payload = _csi_home_get("/perf/indexCsiDsPe", params={"indexCode": index_code})
+        rows = payload.get("data") or []
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError(f"中证 PE-TTM 历史为空: {index_code}")
+        out: list[dict[str, Any]] = []
+        for rec in rows:
+            pe = _official_number(rec.get("peg"))
+            if pe is None:
+                continue
+            out.append(
+                {
+                    "date": _official_date(rec.get("tradeDate")),
+                    "index_code": index_code,
+                    "pe_ttm": pe,
+                    "index_name": rec.get("indexName"),
+                    "source": "csi_indexCsiDsPe",
+                }
+            )
+        if not out:
+            raise RuntimeError(f"中证 PE-TTM 历史无有效点: {index_code}")
+        return out
+
+    return _csi_home_cached(f"pe_ttm:{index_code}", _CSI_HOME_TTL_HISTORY, _load)
+
+
+def index_valuation_snapshots() -> dict[str, dict[str, Any]]:
+    """中证主指数当日估值快照（含静态 PE、PE-TTM、PB、股息率）。
+
+    来源：/csindex-home/data-service/indexValuation。仅覆盖官网展示的少数指数。
+    """
+
+    def _load() -> dict[str, dict[str, Any]]:
+        payload = _csi_home_get("/data-service/indexValuation")
+        data = payload.get("data") or {}
+        trade_date = _official_date(data.get("tradeDate")) if data.get("tradeDate") else None
+        rows = data.get("indexValuations") or []
+        out: dict[str, dict[str, Any]] = {}
+        for rec in rows:
+            code = _CSI_SNAPSHOT_EN_TO_CODE.get(str(rec.get("indexNameEn") or "").strip())
+            if not code:
+                continue
+            out[code] = {
+                "index_code": code,
+                "name": rec.get("indexName"),
+                "name_en": rec.get("indexNameEn"),
+                "pe": _official_number(rec.get("pe")),
+                "pe_ttm": _official_number(rec.get("peg")),
+                "pb": _official_number(rec.get("pb")),
+                "dividend_yield_percent": _official_number(rec.get("dp")),
+                "as_of": trade_date or (
+                    _official_date(rec.get("tradeDate")) if rec.get("tradeDate") else None
+                ),
+                "source": "csi_index_valuation_snapshot",
+            }
+        if not out:
+            raise RuntimeError("中证估值快照为空或无法映射指数代码")
+        return out
+
+    return _csi_home_cached("valuation_snapshots", _CSI_HOME_TTL_SNAPSHOT, _load)
+
+
+def pe_ttm_window_percentiles(
+    history: list[dict[str, Any]],
+    *,
+    windows: Optional[dict[str, int]] = None,
+) -> dict[str, Any]:
+    """按日历天窗口计算 PE-TTM 分位；不得用短窗口冒充长窗口。"""
+    windows = windows or {"1y": 365, "3y": 365 * 3, "5y": 365 * 5}
+    points = [
+        (datetime.strptime(str(r["date"])[:10], "%Y-%m-%d").date(), float(r["pe_ttm"]))
+        for r in history
+        if r.get("date") is not None and r.get("pe_ttm") is not None
+    ]
+    if not points:
+        raise ValueError("PE-TTM 历史为空")
+    points.sort(key=lambda x: x[0])
+    end = points[-1][0]
+    latest = points[-1][1]
+    out: dict[str, Any] = {
+        "pe_ttm": latest,
+        "as_of": end.isoformat(),
+        "sample_size_all": len(points),
+        "pe_percentile_long_basis": "csi_pe_ttm_history",
+        "data_source": "csi_indexCsiDsPe",
+    }
+    for label, days in windows.items():
+        start = end - timedelta(days=days)
+        vals = [v for d, v in points if d >= start]
+        if len(vals) < 20:
+            out[f"pe_percentile_{label}"] = None
+            out[f"pe_percentile_{label}_window_start"] = None
+            out[f"pe_percentile_{label}_window_end"] = None
+            out[f"pe_percentile_{label}_sample_size"] = len(vals)
+            continue
+        out[f"pe_percentile_{label}"] = round(
+            sum(1 for x in vals if x <= latest) / len(vals) * 100, 1
+        )
+        out[f"pe_percentile_{label}_window_start"] = start.isoformat()
+        out[f"pe_percentile_{label}_window_end"] = end.isoformat()
+        out[f"pe_percentile_{label}_sample_size"] = len(vals)
+    return out
+
+
+def series_window_percentiles(
+    history: list[dict[str, Any]],
+    *,
+    value_key: str,
+    prefix: str,
+    windows: Optional[dict[str, int]] = None,
+    min_samples: int = 20,
+    basis: str | None = None,
+    data_source: str | None = None,
+) -> dict[str, Any]:
+    """通用序列分位（股息率等）；短样本不冒充长窗口。"""
+    windows = windows or {"1y": 365, "3y": 365 * 3, "5y": 365 * 5}
+    points: list[tuple[Any, float]] = []
+    for r in history:
+        if r.get("date") is None or r.get(value_key) is None:
+            continue
+        try:
+            d = datetime.strptime(str(r["date"])[:10], "%Y-%m-%d").date()
+            v = float(r[value_key])
+        except (TypeError, ValueError):
+            continue
+        points.append((d, v))
+    if not points:
+        raise ValueError(f"{value_key} 历史为空")
+    points.sort(key=lambda x: x[0])
+    end = points[-1][0]
+    latest = points[-1][1]
+    out: dict[str, Any] = {
+        value_key: latest,
+        "as_of": end.isoformat(),
+        "sample_size_all": len(points),
+        "series": [
+            {"date": d.isoformat(), value_key: v} for d, v in points[-60:]
+        ],
+        f"{prefix}_basis": basis,
+        "data_source": data_source,
+    }
+    for label, days in windows.items():
+        start = end - timedelta(days=days)
+        vals = [v for d, v in points if d >= start]
+        key = f"{prefix}_{label}"
+        if len(vals) < min_samples:
+            out[key] = None
+            out[f"{key}_window_start"] = None
+            out[f"{key}_window_end"] = None
+            out[f"{key}_sample_size"] = len(vals)
+            out[f"{key}_status"] = "insufficient_sample"
+            continue
+        out[key] = round(sum(1 for x in vals if x <= latest) / len(vals) * 100, 1)
+        out[f"{key}_window_start"] = start.isoformat()
+        out[f"{key}_window_end"] = end.isoformat()
+        out[f"{key}_sample_size"] = len(vals)
+        out[f"{key}_status"] = "ok"
+    return out
+
+
 def trading_calendar(year, month):
     """深交所完整自然月日历。未发布或缺日抛错，周末调休不视为交易日。"""
     if type(year) is not int or type(month) is not int or not 1 <= month <= 12:

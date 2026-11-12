@@ -5,6 +5,29 @@ def _invoke(client, cap, payload=None):
     return client.post(f"/capabilities/{cap}/invoke", json={"input": payload or {}})
 
 
+def _order(symbol, side="buy", quantity=100, **extra):
+    """带依据/信心/验证条件的测试订单。"""
+    body = {
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "rationale": extra.pop("rationale", f"测试下单 {symbol}：中长期配置验证"),
+        "confidence": extra.pop("confidence", 70),
+        "verify": extra.pop(
+            "verify",
+            {
+                "horizon_days": 5,
+                "metric": "return_vs_cost",
+                "op": "gte",
+                "target": 0.02,
+                "summary": "5个交易日内相对成本涨幅≥2%",
+            },
+        ),
+    }
+    body.update(extra)
+    return body
+
+
 def test_list_and_invoke_list_capabilities(client):
     r = client.get("/capabilities")
     assert r.status_code == 200
@@ -42,14 +65,14 @@ def test_screen_market_and_stock_order(client):
     order = _invoke(
         client,
         "submit_order",
-        {"symbol": pick, "side": "buy", "quantity": 100},
+        _order(pick),
     )
     assert order.status_code == 200
     assert order.json()["result"]["status"] == "filled"
     blocked = _invoke(
         client,
         "submit_order",
-        {"symbol": "000300", "side": "buy", "quantity": 100},
+        _order("000300"),
     )
     assert blocked.status_code == 400
 
@@ -161,7 +184,7 @@ def test_screen_etf_and_convertible_bond(client):
     assert any(c["code"].startswith(("51", "15", "58")) for c in etf_body["candidates"])
     etf_code = etf_body["candidates"][0]["code"]
     etf_order = _invoke(
-        client, "submit_order", {"symbol": etf_code, "side": "buy", "quantity": 100}
+        client, "submit_order", _order(etf_code)
     )
     assert etf_order.status_code == 200
 
@@ -172,7 +195,7 @@ def test_screen_etf_and_convertible_bond(client):
     cb_code = cb_body["candidates"][0]["code"]
     assert cb_code.startswith(("11", "12"))
     cb_order = _invoke(
-        client, "submit_order", {"symbol": cb_code, "side": "buy", "quantity": 10}
+        client, "submit_order", _order(cb_code, quantity=10)
     )
     assert cb_order.status_code == 200
 
@@ -224,13 +247,12 @@ def test_decision_paper_trade_and_review_cr(client, monkeypatch):
     order = client.post(
         "/capabilities/submit_order/invoke",
         json={
-            "input": {
-                "symbol": "511010",
-                "side": "buy",
-                "quantity": 1000,
-                "decision_id": dec["decision_id"],
-                "agent_run_id": run_id,
-            }
+            "input": _order(
+                "511010",
+                quantity=1000,
+                decision_id=dec["decision_id"],
+                agent_run_id=run_id,
+            )
         },
     )
     assert order.status_code == 200
@@ -311,7 +333,7 @@ def test_order_blocked_when_market_closed(client, monkeypatch):
     r = _invoke(
         client,
         "submit_order",
-        {"symbol": "510300", "side": "buy", "quantity": 100},
+        _order("510300"),
     )
     assert r.status_code == 400
     assert "MarketClosed" in r.json()["detail"]
@@ -332,7 +354,7 @@ def test_cr_blocked_during_intraday(client):
 
 
 def test_settle_day_and_day_report(client, monkeypatch):
-    _invoke(client, "submit_order", {"symbol": "510300", "side": "buy", "quantity": 100})
+    _invoke(client, "submit_order", _order("510300"))
     blocked = _invoke(client, "settle_day")
     assert blocked.status_code == 400
     monkeypatch.setattr("evo_api.services.market_session.now_cn", lambda: POSTCLOSE_NOW)
@@ -528,7 +550,7 @@ def test_t_plus_one_blocks_same_day_sell(client, monkeypatch):
     buy = _invoke(
         client,
         "submit_order",
-        {"symbol": "510300", "side": "buy", "quantity": 100},
+        _order("510300"),
     )
     assert buy.status_code == 200
     assert buy.json()["result"]["status"] == "filled"
@@ -540,7 +562,7 @@ def test_t_plus_one_blocks_same_day_sell(client, monkeypatch):
     blocked = _invoke(
         client,
         "submit_order",
-        {"symbol": "510300", "side": "sell", "quantity": 100},
+        _order("510300", side="sell"),
     )
     assert blocked.status_code == 400
     assert "T+1" in blocked.json()["detail"]
@@ -558,7 +580,7 @@ def test_t_plus_one_blocks_same_day_sell(client, monkeypatch):
     sold = _invoke(
         client,
         "submit_order",
-        {"symbol": "510300", "side": "sell", "quantity": 100},
+        _order("510300", side="sell"),
     )
     assert sold.status_code == 200
     assert sold.json()["result"]["status"] == "filled"
@@ -570,7 +592,7 @@ def test_desk_and_portfolio_pnl(client):
     order = _invoke(
         client,
         "submit_order",
-        {"symbol": "510300", "side": "buy", "quantity": 100},
+        _order("510300"),
     )
     assert order.status_code == 200
     desk = client.get("/admin/desk", headers=headers)

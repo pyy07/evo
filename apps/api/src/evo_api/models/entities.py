@@ -64,6 +64,12 @@ class OrderStatus(str, enum.Enum):
     rejected = "rejected"
 
 
+class TradeVerifyStatus(str, enum.Enum):
+    pending = "pending"
+    verified = "verified"
+    skipped = "skipped"
+
+
 class Capability(Base):
     __tablename__ = "capabilities"
 
@@ -154,6 +160,10 @@ class Order(Base):
     quantity: Mapped[float] = mapped_column(Float)
     status: Mapped[OrderStatus] = mapped_column(Enum(OrderStatus))
     reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 下单时必填：依据 / 信心 / 结构化验证条件（成交时拷贝到 Trade）
+    rationale: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    verify_spec: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     trades: Mapped[list["Trade"]] = relationship(back_populates="order")
@@ -169,6 +179,17 @@ class Trade(Base):
     quantity: Mapped[float] = mapped_column(Float)
     price: Mapped[float] = mapped_column(Float)
     commission: Mapped[float] = mapped_column(Float, default=0.0)
+    rationale: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    verify_spec: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    verify_due_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True, index=True)
+    # 存 pending|verified|skipped 字符串，避免 PG 新增 enum 类型迁移摩擦
+    verify_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    verify_eval: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    verify_outcome: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    verify_lesson: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    verified_review_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     order: Mapped["Order"] = relationship(back_populates="trades")
@@ -235,6 +256,10 @@ class Settlement(Base):
     agent_run_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("agent_runs.id"), nullable=True
     )
+    # 日初权益基准：上一交易日清算缺失时标 stale，避免跨日归因冒充单日
+    open_basis_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    open_basis_stale: Mapped[bool] = mapped_column(Boolean, default=False)
+    attribution: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     notes: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

@@ -33,6 +33,7 @@ POSTCLOSE_CAPABILITY_TOOLS = frozenset(
         "get_macro_digest",
         "list_experiences",
         "list_change_requests",
+        "list_trade_verifications",
     }
 )
 
@@ -108,6 +109,23 @@ FINALIZE_TOOL: dict[str, Any] = {
                         "required": ["change_request_id", "passed"],
                     },
                 },
+                "trade_verifications": {
+                    "type": "array",
+                    "description": (
+                        "对 list_trade_verifications(due) 中每笔成交的验收结论；"
+                        "无到期项可为 []"
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "trade_id": {"type": "integer"},
+                            "outcome": {"type": "string"},
+                            "lesson": {"type": "string"},
+                            "skip": {"type": "boolean"},
+                        },
+                        "required": ["trade_id", "outcome"],
+                    },
+                },
             },
             "required": ["review_content", "issue_type"],
         },
@@ -151,8 +169,10 @@ def run_postclose_agent_loop(
             f"清算摘要：{settle_summary}\n"
             "重点阅读 list_today_decisions / get_day_report 中每条决策的 usage_notes"
             "（missing_tool / tool_error / tool_improve），据此沉淀 lessons 或提出 CR。\n"
+            "务必调用 list_trade_verifications(status=due)：对到期成交阅读依据/信心/"
+            "验证条件与 live_eval，并在 finalize.trade_verifications 写 outcome。\n"
             "建议工具：get_day_report、list_today_decisions、list_today_orders、"
-            "list_experiences、list_change_requests；"
+            "list_trade_verifications、list_experiences、list_change_requests；"
             "宏观与联播用 get_macro_digest，持仓披露用 get_announcements，"
             "当日资讯可用 get_market_news。\n"
             "完成后必须调用 finalize_postclose_review；"

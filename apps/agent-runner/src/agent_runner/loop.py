@@ -36,7 +36,10 @@ INTRADAY_PROMPT = """你是「自演进投资系统」中的投资 Agent：中�
 9. 下单数量须符合手数；不可交易指数本身。
 10. finalize 时除观察/决策/订单外，必须输出 usage_notes（工具使用心得：
    missing_tool / tool_error / tool_improve / other）；无心得则 []。
-11. 调研结束后必须调用 finalize_intraday_decision；orders 可为空。
+11. 若下单：每笔 orders[] 必须含 rationale、confidence(0-100)、verify
+   （horizon_days/metric/op/target/summary；metric=return_vs_cost|
+   return_vs_benchmark|still_held）。缺一系统拒单。观望则 orders=[]。
+12. 调研结束后必须调用 finalize_intraday_decision；orders 可为空。
 """
 
 POSTCLOSE_PROMPT = """你是「自演进投资系统」中的投资 Agent：中长期价值导向，不是短线交易者。
@@ -52,11 +55,14 @@ POSTCLOSE_PROMPT = """你是「自演进投资系统」中的投资 Agent：中�
 4. 必须汇总当日决策里的 usage_notes；能归并为使用经验或 CR 则写入，无实质问题可不硬凑。
 5. 跟进过往 CR：拒绝理由要读；已完成的可以验收（passed true/false）；
    验收通过后应用 agent/system lesson 更新对应工具口径。
-6. 可用 get_macro_digest / get_announcements / get_market_news 补充宏观与披露上下文。
-7. 禁止下单；不要直接调用 submit_review / create_change_request。
-8. issue_type：NoIssue | DecisionError | DataGap | CapabilityGap | ToolUsageError。
-9. CapabilityGap/DataGap 时优先封装 a-stock-data 端点，proposal 写明端点名。
-10. 结束后必须调用 finalize_postclose_review。
+6. 成交验证：先 list_trade_verifications(status=due)，阅读 rationale/confidence/verify_spec
+   与 live_eval；对每笔在 finalize.trade_verifications 给出 outcome（可附 lesson）。
+   客观指标以系统 live_eval 为准，勿编造价格。
+7. 可用 get_macro_digest / get_announcements / get_market_news 补充宏观与披露上下文。
+8. 禁止下单；不要直接调用 submit_review / create_change_request。
+9. issue_type：NoIssue | DecisionError | DataGap | CapabilityGap | ToolUsageError。
+10. CapabilityGap/DataGap 时优先封装 a-stock-data 端点，proposal 写明端点名。
+11. 结束后必须调用 finalize_postclose_review。
 """
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -103,6 +109,9 @@ def _orders_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "symbol": payload.get("symbol"),
                 "side": payload.get("side") or "buy",
                 "quantity": payload.get("quantity") or 100,
+                "rationale": payload.get("rationale"),
+                "confidence": payload.get("confidence"),
+                "verify": payload.get("verify"),
             },
             *raw,
         ]
@@ -123,7 +132,16 @@ def _orders_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if key in seen:
             continue
         seen.add(key)
-        out.append({"symbol": symbol, "side": side, "quantity": qty})
+        out.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "quantity": qty,
+                "rationale": item.get("rationale"),
+                "confidence": item.get("confidence"),
+                "verify": item.get("verify"),
+            }
+        )
     return out
 
 
@@ -267,6 +285,9 @@ def _run_intraday_body(
                     "symbol": order["symbol"],
                     "side": order["side"],
                     "quantity": order["quantity"],
+                    "rationale": order.get("rationale"),
+                    "confidence": order.get("confidence"),
+                    "verify": order.get("verify"),
                     "decision_id": dec["decision_id"],
                     "agent_run_id": run_id,
                 },
@@ -381,6 +402,21 @@ def _run_postclose_body(
             )
         )
 
+    trade_verifications = []
+    review_id = review.get("review_id") if isinstance(review, dict) else None
+    for item in decision_payload.get("trade_verifications") or []:
+        if not isinstance(item, dict) or item.get("trade_id") is None:
+            continue
+        body = {
+            "trade_id": int(item["trade_id"]),
+            "outcome": item.get("outcome") or "",
+            "lesson": item.get("lesson"),
+            "skip": bool(item.get("skip")),
+        }
+        if review_id is not None:
+            body["review_id"] = review_id
+        trade_verifications.append(client.invoke("submit_trade_verification", body))
+
     client.invoke(
         "finish_agent_run",
         {"agent_run_id": run_id, "status": "completed", "notes": "盘后清算+复盘完成"},
@@ -391,6 +427,7 @@ def _run_postclose_body(
         "settlement": settlement,
         "review": review,
         "verifications": verifications,
+        "trade_verifications": trade_verifications,
         "tool_trace": tool_trace,
         "llm_used": bool(settings.openai_api_key),
     }

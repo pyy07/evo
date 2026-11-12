@@ -170,18 +170,112 @@ def etf_rules() -> dict[str, Any]:
 
 
 def get_price(symbol: str) -> float:
+    """盘中成交用：最新价（可能非收盘价）。"""
+    return float(get_mark_quote(symbol, mode="last")["price"])
+
+
+def get_mark_quote(
+    symbol: str,
+    *,
+    mode: str = "last",
+    as_of: date | None = None,
+) -> dict[str, Any]:
+    """估值报价。mode=close 优先官方/K 线收盘价；mode=last 用快照最新价。"""
+    symbol = "".join(ch for ch in str(symbol) if ch.isdigit())[-6:] or str(symbol).strip()
+    as_of = as_of or _today_cn()
     provider = get_provider()
+    intraday: float | None = None
     try:
         quotes = provider.get_market_snapshot([symbol])
-    except MarketDataError as exc:
-        raise ValueError(f"行情不可用：{exc}") from exc
-    q = quotes.get(symbol) or next(iter(quotes.values()), None)
-    if not q:
-        raise ValueError(f"找不到报价：{symbol}")
-    for key in ("price", "current", "last", "close"):
-        if key in q and q[key] is not None:
-            return float(q[key])
-    raise ValueError(f"报价缺少价格字段：{symbol} → {q}")
+        q = quotes.get(symbol) or next(iter(quotes.values()), None) or {}
+        for key in ("price", "current", "last", "close"):
+            if key in q and q[key] is not None:
+                try:
+                    intraday = float(q[key])
+                    break
+                except (TypeError, ValueError):
+                    pass
+    except MarketDataError:
+        q = {}
+    if mode == "last":
+        if intraday is None:
+            raise ValueError(f"找不到报价：{symbol}")
+        return {
+            "price": intraday,
+            "mark_price_intraday": intraday,
+            "mark_price_source": "last",
+            "mark_as_of": as_of.isoformat(),
+        }
+    # close：K 线收盘（≤ as_of 最近一根）
+    try:
+        bars = provider.get_etf_history(symbol, count=15) or []
+    except Exception:  # noqa: BLE001
+        bars = []
+    close_px: float | None = None
+    close_date: str | None = None
+    for bar in reversed(list(bars)):
+        raw = str(bar.get("date") or "")[:10]
+        try:
+            bd = date.fromisoformat(raw)
+        except ValueError:
+            continue
+        if bd > as_of:
+            continue
+        px = bar.get("close") if bar.get("close") is not None else bar.get("price")
+        try:
+            close_px = float(px)
+            close_date = bd.isoformat()
+            break
+        except (TypeError, ValueError):
+            continue
+    if close_px is not None:
+        out = {
+            "price": close_px,
+            "mark_price_source": "close",
+            "mark_as_of": close_date or as_of.isoformat(),
+        }
+        if intraday is not None:
+            out["mark_price_intraday"] = intraday
+        return out
+    if intraday is not None:
+        return {
+            "price": intraday,
+            "mark_price_intraday": intraday,
+            "mark_price_source": "last_fallback",
+            "mark_as_of": as_of.isoformat(),
+            "mark_tip": "收盘价不可用，已回退最新价",
+        }
+    raise ValueError(f"找不到报价：{symbol}")
+
+
+def previous_trading_day(day: date) -> date:
+    d = day - timedelta(days=1)
+    for _ in range(20):
+        try:
+            if market_session_svc.is_trading_day(d):
+                return d
+        except Exception:  # noqa: BLE001
+            if d.weekday() < 5:
+                return d
+        d -= timedelta(days=1)
+    return day - timedelta(days=1)
+
+
+def trading_days_between(start_exclusive: date, end_exclusive: date) -> list[date]:
+    """(start, end) 开区间内的交易日。"""
+    out: list[date] = []
+    d = start_exclusive + timedelta(days=1)
+    guard = 0
+    while d < end_exclusive and guard < 40:
+        guard += 1
+        try:
+            ok = market_session_svc.is_trading_day(d)
+        except Exception:  # noqa: BLE001
+            ok = d.weekday() < 5
+        if ok:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
 
 
 def _seed_name_map() -> dict[str, str]:
@@ -223,61 +317,248 @@ def resolve_instrument_names(codes: list[str]) -> dict[str, str]:
     return {c: names.get(c, c) for c in bare}
 
 
-def portfolio_view(db: Session) -> dict[str, Any]:
+def _mark_positions(
+    positions: list[Position] | list[dict[str, Any]],
+    *,
+    mark_mode: str,
+    as_of: date,
+    name_map: dict[str, str],
+    db: Session | None = None,
+) -> tuple[list[dict[str, Any]], float, float, float]:
+    """返回 (marked, equity_ex_cash_add, unrealized, cost_basis)；调用方再加 cash。"""
+    marked: list[dict[str, Any]] = []
+    mv_sum = 0.0
+    unrealized = 0.0
+    cost_basis = 0.0
+    for p in positions:
+        if isinstance(p, dict):
+            symbol = str(p.get("symbol") or "")
+            qty = float(p.get("quantity") or 0)
+            avg_cost = float(p.get("avg_cost") or 0)
+        else:
+            symbol = p.symbol
+            qty = float(p.quantity)
+            avg_cost = float(p.avg_cost)
+        if abs(qty) < 1e-12:
+            continue
+        try:
+            quote = get_mark_quote(symbol, mode=mark_mode, as_of=as_of)
+            px = float(quote["price"])
+            src = quote.get("mark_price_source")
+            intraday = quote.get("mark_price_intraday")
+            mark_as_of = quote.get("mark_as_of")
+        except ValueError:
+            px = avg_cost
+            src = "avg_cost_fallback"
+            intraday = None
+            mark_as_of = as_of.isoformat()
+        mv = px * qty
+        cost = avg_cost * qty
+        pnl = mv - cost
+        mv_sum += mv
+        unrealized += pnl
+        cost_basis += cost
+        code = "".join(ch for ch in str(symbol) if ch.isdigit())[-6:] or symbol
+        row: dict[str, Any] = {
+            "symbol": symbol,
+            "name": name_map.get(code) or symbol,
+            "quantity": qty,
+            "avg_cost": avg_cost,
+            "mark_price": px,
+            "mark_price_source": src,
+            "mark_as_of": mark_as_of,
+            "market_value": mv,
+            "cost_basis": cost,
+            "unrealized_pnl": pnl,
+            "unrealized_pnl_pct": (pnl / cost * 100.0) if cost else 0.0,
+        }
+        if intraday is not None:
+            row["mark_price_intraday"] = intraday
+        if db is not None and not isinstance(p, dict):
+            row["sellable_quantity"] = sellable_quantity(db, symbol, qty)
+            row["locked_quantity"] = bought_today_quantity(db, symbol)
+        marked.append(row)
+    return marked, mv_sum, unrealized, cost_basis
+
+
+def _open_basis(db: Session, trade_date: date, *, initial_cash: float) -> dict[str, Any]:
+    """日初权益/现金基准：优先上一交易日清算；缺失则标 stale。"""
+    prev_td = previous_trading_day(trade_date)
+    exact = (
+        db.query(Settlement)
+        .filter(Settlement.trade_date == prev_td)
+        .one_or_none()
+    )
+    if exact is not None:
+        return {
+            "open_equity": float(exact.close_equity),
+            "open_cash": float(exact.close_cash),
+            "open_basis_date": prev_td,
+            "open_basis_stale": False,
+            "prev_close_source": "settlement",
+            "prev_positions": exact.positions or {},
+        }
+    any_prior = (
+        db.query(Settlement)
+        .filter(Settlement.trade_date < trade_date)
+        .order_by(Settlement.trade_date.desc())
+        .first()
+    )
+    snap = _latest_snapshot_on_or_before(db, prev_td)
+    if snap is not None:
+        name_map = resolve_instrument_names(
+            [str(k) for k in (snap.positions or {}).keys()]
+        )
+        norm: list[dict[str, Any]] = []
+        for sym, v in (snap.positions or {}).items():
+            if not isinstance(v, dict):
+                continue
+            norm.append(
+                {
+                    "symbol": str(sym),
+                    "quantity": float(v.get("quantity") or 0),
+                    "avg_cost": float(v.get("avg_cost") or 0),
+                }
+            )
+        marked, mv, _, _ = _mark_positions(
+            norm, mark_mode="close", as_of=prev_td, name_map=name_map
+        )
+        equity = float(snap.cash) + mv
+        return {
+            "open_equity": equity,
+            "open_cash": float(snap.cash),
+            "open_basis_date": prev_td,
+            "open_basis_stale": any_prior is None
+            or any_prior.trade_date != prev_td,
+            "prev_close_source": "snapshot_revalued",
+            "prev_positions": {p["symbol"]: p for p in marked},
+            "open_basis_tip": (
+                f"上一交易日 {prev_td.isoformat()} 无清算行，"
+                f"已用快照#{snap.id} 按收盘价重估"
+                + (
+                    f"（最近清算日={any_prior.trade_date.isoformat()}）"
+                    if any_prior
+                    else ""
+                )
+            ),
+        }
+    if any_prior is not None:
+        return {
+            "open_equity": float(any_prior.close_equity),
+            "open_cash": float(any_prior.close_cash),
+            "open_basis_date": any_prior.trade_date,
+            "open_basis_stale": True,
+            "prev_close_source": "settlement_gap",
+            "prev_positions": any_prior.positions or {},
+            "open_basis_tip": (
+                f"缺 {prev_td.isoformat()} 清算，暂用 {any_prior.trade_date.isoformat()} "
+                "收盘权益；day_pnl 可能跨多日，勿当单日归因"
+            ),
+        }
+    return {
+        "open_equity": float(initial_cash),
+        "open_cash": float(initial_cash),
+        "open_basis_date": None,
+        "open_basis_stale": False,
+        "prev_close_source": "initial_cash",
+        "prev_positions": {},
+    }
+
+
+def _latest_snapshot_on_or_before(db: Session, day: date) -> PortfolioSnapshot | None:
+    snaps = (
+        db.query(PortfolioSnapshot)
+        .order_by(PortfolioSnapshot.created_at.desc())
+        .limit(800)
+        .all()
+    )
+    on_day: PortfolioSnapshot | None = None
+    before: PortfolioSnapshot | None = None
+    for s in snaps:
+        d = _to_cn_date(s.created_at)
+        if not d:
+            continue
+        if d == day and on_day is None:
+            on_day = s
+        if d < day and before is None:
+            before = s
+        if on_day and before:
+            break
+    return on_day or before
+
+
+def portfolio_view(
+    db: Session,
+    *,
+    mark_mode: str = "last",
+    as_of: date | None = None,
+) -> dict[str, Any]:
     acct = ensure_account(db)
     settings = get_settings()
     instruments = load_instruments()
     initial_cash = float(instruments.get("default_cash", settings.initial_cash))
     positions = db.query(Position).filter(Position.quantity != 0).all()
     name_map = resolve_instrument_names([p.symbol for p in positions])
-    marked: list[dict[str, Any]] = []
-    equity = acct.cash
-    unrealized = 0.0
-    cost_basis = 0.0
-    for p in positions:
-        try:
-            px = get_price(p.symbol)
-        except ValueError:
-            px = p.avg_cost
-        mv = px * p.quantity
-        cost = p.avg_cost * p.quantity
-        pnl = mv - cost
-        equity += mv
-        unrealized += pnl
-        cost_basis += cost
-        locked = bought_today_quantity(db, p.symbol)
-        sellable = sellable_quantity(db, p.symbol, p.quantity)
-        code = "".join(ch for ch in str(p.symbol) if ch.isdigit())[-6:] or p.symbol
-        marked.append(
-            {
-                "symbol": p.symbol,
-                "name": name_map.get(code) or p.symbol,
-                "quantity": p.quantity,
-                "sellable_quantity": sellable,
-                "locked_quantity": locked,
-                "avg_cost": p.avg_cost,
-                "mark_price": px,
-                "market_value": mv,
-                "cost_basis": cost,
-                "unrealized_pnl": pnl,
-                "unrealized_pnl_pct": (pnl / cost * 100.0) if cost else 0.0,
-            }
-        )
-    total_pnl = equity - initial_cash
-    today = _today_cn()
-    snaps = (
-        db.query(PortfolioSnapshot)
-        .order_by(PortfolioSnapshot.created_at.desc())
-        .limit(500)
-        .all()
+    today = as_of or _today_cn()
+    marked, mv_sum, unrealized, cost_basis = _mark_positions(
+        positions,
+        mark_mode=mark_mode,
+        as_of=today,
+        name_map=name_map,
+        db=db,
     )
-    prior = [s for s in snaps if _to_cn_date(s.created_at) and _to_cn_date(s.created_at) < today]
-    same_day = [
-        s for s in snaps if _to_cn_date(s.created_at) and _to_cn_date(s.created_at) == today
-    ]
-    baseline = prior[0] if prior else (same_day[-1] if same_day else None)
-    day_start_equity = float(baseline.equity) if baseline else initial_cash
+    equity = float(acct.cash) + mv_sum
+    total_pnl = equity - initial_cash
+    basis = _open_basis(db, today, initial_cash=initial_cash)
+    day_start_equity = float(basis["open_equity"])
     day_pnl = equity - day_start_equity
+    prev_pos = basis.get("prev_positions") or {}
+    # 当日成交：用于持仓级 day_pnl（买入腿按现价−成交价）
+    today_trades = [
+        t
+        for t in db.query(Trade).order_by(Trade.id.asc()).all()
+        if _to_cn_date(t.created_at) == today
+    ]
+    buy_qty: dict[str, float] = {}
+    buy_notional: dict[str, float] = {}
+    sell_qty: dict[str, float] = {}
+    sell_notional: dict[str, float] = {}
+    for t in today_trades:
+        sym = t.symbol
+        qty = float(t.quantity)
+        px = float(t.price)
+        if t.side == OrderSide.buy or str(t.side) == "buy":
+            buy_qty[sym] = buy_qty.get(sym, 0.0) + qty
+            buy_notional[sym] = buy_notional.get(sym, 0.0) + px * qty
+        else:
+            sell_qty[sym] = sell_qty.get(sym, 0.0) + qty
+            sell_notional[sym] = sell_notional.get(sym, 0.0) + px * qty
+    for row in marked:
+        sym = row["symbol"]
+        prev = prev_pos.get(sym) or {}
+        prev_qty = float(prev.get("quantity") or 0)
+        prev_px = float(prev.get("mark_price") or prev.get("avg_cost") or 0)
+        curr_qty = float(row["quantity"])
+        curr_px = float(row["mark_price"])
+        b_qty = float(buy_qty.get(sym) or 0)
+        s_qty = float(sell_qty.get(sym) or 0)
+        buy_avg = (buy_notional[sym] / b_qty) if b_qty > 1e-12 else 0.0
+        sell_avg = (sell_notional[sym] / s_qty) if s_qty > 1e-12 else 0.0
+        retained = max(0.0, prev_qty - s_qty)
+        hold = retained * (curr_px - prev_px) if retained and prev_px else 0.0
+        sell_leg = s_qty * (sell_avg - prev_px) if s_qty and prev_px else 0.0
+        buy_leg = b_qty * (curr_px - buy_avg) if b_qty else 0.0
+        pos_day = hold + sell_leg + buy_leg
+        row["prev_close"] = prev_px or None
+        row["prev_qty"] = prev_qty
+        row["day_pnl"] = round(pos_day, 2)
+        # 涨跌幅：相对昨收（有昨收时）；新开仓相对买入均价
+        if prev_px:
+            row["day_pnl_pct"] = round((curr_px - prev_px) / prev_px * 100.0, 3)
+        elif buy_avg:
+            row["day_pnl_pct"] = round((curr_px - buy_avg) / buy_avg * 100.0, 3)
+        else:
+            row["day_pnl_pct"] = None
     return {
         "cash": acct.cash,
         "equity": equity,
@@ -291,7 +572,18 @@ def portfolio_view(db: Session) -> dict[str, Any]:
         "day_pnl": day_pnl,
         "day_pnl_pct": (day_pnl / day_start_equity * 100.0) if day_start_equity else 0.0,
         "day_start_equity": day_start_equity,
+        "open_cash": basis["open_cash"],
+        "open_basis_date": (
+            basis["open_basis_date"].isoformat()
+            if isinstance(basis.get("open_basis_date"), date)
+            else basis.get("open_basis_date")
+        ),
+        "open_basis_stale": bool(basis.get("open_basis_stale")),
+        "prev_close_source": basis.get("prev_close_source"),
+        "open_basis_tip": basis.get("open_basis_tip"),
+        "mark_mode": mark_mode,
         "positions": marked,
+        "_prev_positions": prev_pos,
     }
 
 
@@ -454,6 +746,9 @@ def desk_today(db: Session) -> dict[str, Any]:
                 "quantity": o.quantity,
                 "status": o.status.value,
                 "reason": o.reason,
+                "rationale": o.rationale,
+                "confidence": o.confidence,
+                "verify_spec": o.verify_spec,
                 "decision_id": o.decision_id,
                 "agent_run_id": o.agent_run_id,
                 "created_at": o.created_at.isoformat() if o.created_at else None,
@@ -471,6 +766,13 @@ def desk_today(db: Session) -> dict[str, Any]:
 def _trade_item(t: Trade, *, name_map: dict[str, str] | None = None) -> dict[str, Any]:
     code = "".join(ch for ch in str(t.symbol) if ch.isdigit())[-6:] or t.symbol
     name = (name_map or {}).get(code) or t.symbol
+    today = _today_cn()
+    due = t.verify_due_date
+    st = (
+        t.verify_status.value
+        if hasattr(t.verify_status, "value")
+        else t.verify_status
+    )
     return {
         "id": t.id,
         "order_id": t.order_id,
@@ -481,6 +783,15 @@ def _trade_item(t: Trade, *, name_map: dict[str, str] | None = None) -> dict[str
         "price": t.price,
         "amount": round(float(t.price) * float(t.quantity), 2),
         "commission": t.commission,
+        "rationale": t.rationale,
+        "confidence": t.confidence,
+        "verify_spec": t.verify_spec,
+        "verify_due_date": due.isoformat() if due else None,
+        "verify_status": st,
+        "is_due": bool(st == "pending" and due is not None and due <= today),
+        "verify_eval": t.verify_eval,
+        "verify_outcome": t.verify_outcome,
+        "verify_lesson": t.verify_lesson,
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "trade_date": (
             _to_cn_date(t.created_at).isoformat() if _to_cn_date(t.created_at) else None
@@ -549,29 +860,6 @@ def _day_trade_amounts(trades: list[dict[str, Any]]) -> tuple[float, float]:
     return round(buy, 2), round(sell, 2)
 
 
-def _open_cash_baseline(db: Session, trade_date: date, fallback_cash: float) -> float:
-    """日初现金：优先前日清算 close_cash，否则前日快照现金。"""
-    prior_settle = (
-        db.query(Settlement)
-        .filter(Settlement.trade_date < trade_date)
-        .order_by(Settlement.trade_date.desc())
-        .first()
-    )
-    if prior_settle is not None:
-        return float(prior_settle.close_cash)
-    snaps = (
-        db.query(PortfolioSnapshot)
-        .order_by(PortfolioSnapshot.created_at.desc())
-        .limit(500)
-        .all()
-    )
-    for s in snaps:
-        d = _to_cn_date(s.created_at)
-        if d and d < trade_date:
-            return float(s.cash)
-    return float(fallback_cash)
-
-
 def _settlement_dict(row: Settlement) -> dict[str, Any]:
     return {
         "id": row.id,
@@ -593,9 +881,158 @@ def _settlement_dict(row: Settlement) -> dict[str, Any]:
         "positions": row.positions or {},
         "snapshot_id": row.snapshot_id,
         "agent_run_id": row.agent_run_id,
+        "open_basis_date": (
+            row.open_basis_date.isoformat() if row.open_basis_date else None
+        ),
+        "open_basis_stale": bool(row.open_basis_stale),
+        "attribution": row.attribution,
         "notes": row.notes or "",
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _build_attribution(
+    *,
+    trade_date: date,
+    view: dict[str, Any],
+    trades: list[dict[str, Any]],
+    buy_amount: float,
+    sell_amount: float,
+) -> dict[str, Any]:
+    """持仓级日归因。
+
+    留存仓：retained = max(0, prev_qty − sold_qty)，计入 holding_price_pnl；
+    卖出腿：(卖出价 − 昨收) × 卖出量；买入腿：(收盘 − 买入价) × 买入量；
+    费用单列。恒等式：equity_delta ≈ holding + trade_mark − fees。
+    """
+    prev_pos = view.get("_prev_positions") or {}
+    curr_pos = {p["symbol"]: p for p in (view.get("positions") or [])}
+
+    # 按标的汇总当日买卖
+    buy_qty: dict[str, float] = {}
+    sell_qty: dict[str, float] = {}
+    buy_notional: dict[str, float] = {}
+    sell_notional: dict[str, float] = {}
+    fees = 0.0
+    for t in trades:
+        sym = str(t.get("symbol") or "")
+        qty = float(t.get("quantity") or 0)
+        px = float(t.get("price") or 0)
+        fee = float(t.get("commission") or 0)
+        fees += fee
+        side = t.get("side")
+        if side == "buy" or side == OrderSide.buy:
+            buy_qty[sym] = buy_qty.get(sym, 0.0) + qty
+            buy_notional[sym] = buy_notional.get(sym, 0.0) + px * qty
+        elif side == "sell" or side == OrderSide.sell:
+            sell_qty[sym] = sell_qty.get(sym, 0.0) + qty
+            sell_notional[sym] = sell_notional.get(sym, 0.0) + px * qty
+
+    symbols = sorted(set(prev_pos) | set(curr_pos) | set(buy_qty) | set(sell_qty))
+    contrib: list[dict[str, Any]] = []
+    holding_pnl = 0.0
+    trade_mark_pnl = 0.0
+    for sym in symbols:
+        prev = prev_pos.get(sym) or {}
+        curr = curr_pos.get(sym) or {}
+        prev_qty = float(prev.get("quantity") or 0)
+        curr_qty = float(curr.get("quantity") or 0)
+        prev_px = float(prev.get("mark_price") or prev.get("avg_cost") or 0)
+        curr_px = float(curr.get("mark_price") or curr.get("avg_cost") or 0)
+        b_qty = float(buy_qty.get(sym) or 0)
+        s_qty = float(sell_qty.get(sym) or 0)
+        buy_avg = (buy_notional[sym] / b_qty) if b_qty > 1e-12 else 0.0
+        sell_avg = (sell_notional[sym] / s_qty) if s_qty > 1e-12 else 0.0
+        # 无当日收盘时，买入腿用成交价占位（pnl=0）；卖出腿用昨收
+        close_px = curr_px or sell_avg or buy_avg or prev_px
+        prev_close = prev_px or sell_avg or buy_avg or close_px
+
+        retained = max(0.0, prev_qty - s_qty)
+        hold_pnl = retained * (close_px - prev_close) if retained and prev_close else 0.0
+        sell_leg = s_qty * (sell_avg - prev_close) if s_qty and prev_close else 0.0
+        buy_leg = b_qty * (close_px - buy_avg) if b_qty else 0.0
+        mark_pnl = sell_leg + buy_leg
+        holding_pnl += hold_pnl
+        trade_mark_pnl += mark_pnl
+
+        implied_curr = prev_qty + b_qty - s_qty
+        if abs(prev_qty) > 1e-9 or abs(curr_qty) > 1e-9 or b_qty or s_qty:
+            contrib.append(
+                {
+                    "symbol": sym,
+                    "prev_qty": prev_qty,
+                    "curr_qty": curr_qty,
+                    "buy_qty": b_qty,
+                    "sell_qty": s_qty,
+                    "traded_qty": b_qty + s_qty,
+                    "retained_qty": retained,
+                    "prev_close": prev_close or None,
+                    "close": close_px or None,
+                    "buy_avg": buy_avg or None,
+                    "sell_avg": sell_avg or None,
+                    "holding_price_pnl": round(hold_pnl, 2),
+                    "trade_mark_pnl": round(mark_pnl, 2),
+                    "sell_leg_pnl": round(sell_leg, 2),
+                    "buy_leg_pnl": round(buy_leg, 2),
+                    "qty_reconcile_delta": round(curr_qty - implied_curr, 4),
+                }
+            )
+
+    equity_delta = float(view["day_pnl"])
+    warnings: list[str] = []
+    if view.get("open_basis_stale"):
+        warnings.append(
+            view.get("open_basis_tip")
+            or "open_basis_stale：日初基准非上一交易日清算，day_pnl 可能跨日"
+        )
+    # 持仓数量对账
+    for row in contrib:
+        if abs(float(row.get("qty_reconcile_delta") or 0)) > 1e-6:
+            warnings.append(
+                f"{row['symbol']} 持仓变动不对账："
+                f"prev {row['prev_qty']}+buy {row['buy_qty']}-sell {row['sell_qty']}"
+                f" ≠ curr {row['curr_qty']}（Δ={row['qty_reconcile_delta']}）"
+            )
+    # 归因恒等式
+    attributed = holding_pnl + trade_mark_pnl - fees
+    gap = attributed - equity_delta
+    if abs(gap) >= 1.0:
+        warnings.append(
+            f"归因不对账：holding {holding_pnl:.2f}+trade_mark {trade_mark_pnl:.2f}"
+            f"-fees {fees:.2f} = {attributed:.2f}，equity_delta={equity_delta:.2f}，"
+            f"差额 {gap:.2f}"
+        )
+    # 现金对账（买入付佣金、卖出扣佣金）
+    cash_delta = float(view["cash"]) - float(view.get("open_cash") or view["cash"])
+    expected_cash_delta = sell_amount - buy_amount - fees
+    if abs(cash_delta - expected_cash_delta) > max(1.0, 0.002 * max(buy_amount, sell_amount, 1)):
+        warnings.append(
+            f"现金变动 {cash_delta:.2f} 与买卖额−佣金 {expected_cash_delta:.2f} 不一致"
+            f"（跨日基准/补清算时属预期）"
+        )
+    basis_date = view.get("open_basis_date")
+    if isinstance(basis_date, date):
+        basis_date = basis_date.isoformat()
+    elif basis_date is not None:
+        basis_date = str(basis_date)[:10]
+    return {
+        "method": "retained_holding+trade_legs-fees",
+        "attribution_window": {
+            "start": basis_date,
+            "end": trade_date.isoformat(),
+        },
+        "prev_close_source": view.get("prev_close_source"),
+        "open_basis_stale": bool(view.get("open_basis_stale")),
+        "equity_delta": round(equity_delta, 2),
+        "holding_price_pnl": round(holding_pnl, 2),
+        "trade_mark_pnl": round(trade_mark_pnl, 2),
+        "fees": round(fees, 2),
+        "attributed_pnl": round(attributed, 2),
+        "reconcile_gap": round(gap, 2),
+        "positions": contrib,
+        "warnings": warnings,
+        "mark_mode": view.get("mark_mode"),
     }
 
 
@@ -612,10 +1049,17 @@ def upsert_settlement(
     trade_date = date.fromisoformat(str(today["date"]))
     open_equity = float(view["day_start_equity"])
     close_equity = float(view["equity"])
-    open_cash = _open_cash_baseline(db, trade_date, float(view["cash"]))
+    open_cash = float(view.get("open_cash") if view.get("open_cash") is not None else view["cash"])
     close_cash = float(view["cash"])
     buy_amount, sell_amount = _day_trade_amounts(today.get("trades") or [])
     positions = {p["symbol"]: p for p in (view.get("positions") or [])}
+    attribution = _build_attribution(
+        trade_date=trade_date,
+        view=view,
+        trades=today.get("trades") or [],
+        buy_amount=buy_amount,
+        sell_amount=sell_amount,
+    )
 
     row = (
         db.query(Settlement)
@@ -644,12 +1088,229 @@ def upsert_settlement(
     )
     row.positions = positions
     row.snapshot_id = snap.id
+    basis_raw = view.get("open_basis_date")
+    if isinstance(basis_raw, date):
+        row.open_basis_date = basis_raw
+    elif basis_raw:
+        try:
+            row.open_basis_date = date.fromisoformat(str(basis_raw)[:10])
+        except ValueError:
+            row.open_basis_date = previous_trading_day(trade_date)
+    else:
+        row.open_basis_date = previous_trading_day(trade_date)
+    row.open_basis_stale = bool(view.get("open_basis_stale"))
+    row.attribution = attribution
     if agent_run_id is not None:
         row.agent_run_id = agent_run_id
-    if notes:
-        row.notes = notes
+    note_bits = [notes] if notes else []
+    if view.get("open_basis_tip"):
+        note_bits.append(str(view["open_basis_tip"]))
+    for w in attribution.get("warnings") or []:
+        note_bits.append(f"warning: {w}")
+    if note_bits:
+        row.notes = " | ".join(note_bits)
     db.flush()
     return row
+
+
+def _backfill_settlement_day(db: Session, day: date) -> Settlement | None:
+    """为缺失交易日补一行清算：优先当日快照按收盘价重估。"""
+    existing = db.query(Settlement).filter(Settlement.trade_date == day).one_or_none()
+    if existing is not None:
+        return existing
+    settings = get_settings()
+    instruments = load_instruments()
+    initial_cash = float(instruments.get("default_cash", settings.initial_cash))
+    basis = _open_basis(db, day, initial_cash=initial_cash)
+    snap = _latest_snapshot_on_or_before(db, day)
+    if snap is None:
+        return None
+    name_map = resolve_instrument_names([str(k) for k in (snap.positions or {}).keys()])
+    norm: list[dict[str, Any]] = []
+    for sym, v in (snap.positions or {}).items():
+        if not isinstance(v, dict):
+            continue
+        norm.append(
+            {
+                "symbol": str(sym),
+                "quantity": float(v.get("quantity") or 0),
+                "avg_cost": float(v.get("avg_cost") or 0),
+            }
+        )
+    marked, mv, unrealized, cost_basis = _mark_positions(
+        norm, mark_mode="close", as_of=day, name_map=name_map
+    )
+    cash = float(snap.cash)
+    equity = cash + mv
+    open_equity = float(basis["open_equity"])
+    day_pnl = equity - open_equity
+    # 当日成交
+    trades = [
+        _trade_item(t)
+        for t in db.query(Trade).order_by(Trade.id.asc()).all()
+        if _to_cn_date(t.created_at) == day
+    ]
+    buy_amount, sell_amount = _day_trade_amounts(trades)
+    view = {
+        "cash": cash,
+        "equity": equity,
+        "day_start_equity": open_equity,
+        "open_cash": basis["open_cash"],
+        "day_pnl": day_pnl,
+        "day_pnl_pct": (day_pnl / open_equity * 100.0) if open_equity else 0.0,
+        "total_pnl": equity - initial_cash,
+        "total_pnl_pct": ((equity - initial_cash) / initial_cash * 100.0)
+        if initial_cash
+        else 0.0,
+        "unrealized_pnl": unrealized,
+        "positions": marked,
+        "open_basis_date": basis.get("open_basis_date"),
+        "open_basis_stale": basis.get("open_basis_stale"),
+        "prev_close_source": basis.get("prev_close_source"),
+        "open_basis_tip": basis.get("open_basis_tip"),
+        "mark_mode": "close",
+        "_prev_positions": basis.get("prev_positions") or {},
+    }
+    today_stub = {
+        "date": day.isoformat(),
+        "trades": trades,
+        "orders": [],
+        "decisions": [],
+        "trade_count": len(trades),
+        "order_count": 0,
+        "decision_count": 0,
+    }
+    return upsert_settlement(
+        db,
+        view=view,
+        snap=snap,
+        today=today_stub,
+        notes=f"补清算 {day.isoformat()}（缺日回填）",
+    )
+
+
+def ensure_prior_settlements(db: Session, trade_date: date) -> list[str]:
+    """补齐首条清算日至 trade_date 之间所有缺失交易日（含历史空洞，如 10-19→10-21 缺 10-20）。"""
+    first = (
+        db.query(Settlement)
+        .filter(Settlement.trade_date < trade_date)
+        .order_by(Settlement.trade_date.asc())
+        .first()
+    )
+    if first is None:
+        return []
+    existing = {
+        r.trade_date
+        for r in db.query(Settlement.trade_date)
+        .filter(Settlement.trade_date < trade_date)
+        .all()
+    }
+    missing = [
+        d
+        for d in trading_days_between(first.trade_date, trade_date)
+        if d not in existing
+    ]
+    filled: list[str] = []
+    for d in missing:
+        row = _backfill_settlement_day(db, d)
+        if row is not None:
+            filled.append(d.isoformat())
+            existing.add(d)
+    # 回填后刷新「缺 open_basis / attribution」的历史行（如 10-21）
+    refreshed = refresh_settlement_open_basis(db, until=trade_date)
+    return filled + [f"refreshed:{x}" for x in refreshed]
+
+
+def refresh_settlement_open_basis(
+    db: Session, *, until: date | None = None
+) -> list[str]:
+    """对 open_basis_date/attribution 缺失的清算行按当前前序清算重算日初基准与归因。"""
+    q = db.query(Settlement).order_by(Settlement.trade_date.asc())
+    if until is not None:
+        q = q.filter(Settlement.trade_date < until)
+    rows = q.all()
+    settings = get_settings()
+    instruments = load_instruments()
+    initial_cash = float(instruments.get("default_cash", settings.initial_cash))
+    touched: list[str] = []
+    for row in rows:
+        prev_td = previous_trading_day(row.trade_date)
+        prev_row = (
+            db.query(Settlement)
+            .filter(Settlement.trade_date == prev_td)
+            .one_or_none()
+        )
+        needs = row.open_basis_date is None or row.attribution is None
+        # 历史空洞补齐后：旧行仍指向更早日，需改挂到上一交易日
+        if prev_row is not None and row.open_basis_date != prev_td:
+            needs = True
+        if not needs:
+            continue
+        basis = _open_basis(db, row.trade_date, initial_cash=initial_cash)
+        open_equity = float(basis["open_equity"])
+        open_cash = float(basis["open_cash"])
+        close_equity = float(row.close_equity)
+        day_pnl = close_equity - open_equity
+        # 重建 attribution（用落库 positions 作当日收盘仓）
+        pos_map = row.positions or {}
+        marked = []
+        for sym, v in pos_map.items():
+            if isinstance(v, dict):
+                marked.append(v if "symbol" in v else {"symbol": sym, **v})
+        trades = [
+            _trade_item(t)
+            for t in db.query(Trade).order_by(Trade.id.asc()).all()
+            if _to_cn_date(t.created_at) == row.trade_date
+        ]
+        buy_amount, sell_amount = _day_trade_amounts(trades)
+        view = {
+            "cash": float(row.close_cash),
+            "equity": close_equity,
+            "day_start_equity": open_equity,
+            "open_cash": open_cash,
+            "day_pnl": day_pnl,
+            "day_pnl_pct": (day_pnl / open_equity * 100.0) if open_equity else 0.0,
+            "positions": marked,
+            "open_basis_date": basis.get("open_basis_date"),
+            "open_basis_stale": basis.get("open_basis_stale"),
+            "prev_close_source": basis.get("prev_close_source"),
+            "open_basis_tip": basis.get("open_basis_tip"),
+            "mark_mode": "close",
+            "_prev_positions": basis.get("prev_positions") or {},
+        }
+        attr = _build_attribution(
+            trade_date=row.trade_date,
+            view=view,
+            trades=trades,
+            buy_amount=buy_amount,
+            sell_amount=sell_amount,
+        )
+        row.open_equity = open_equity
+        row.open_cash = open_cash
+        row.day_pnl = day_pnl
+        row.day_pnl_pct = float(view["day_pnl_pct"])
+        basis_raw = basis.get("open_basis_date")
+        if isinstance(basis_raw, date):
+            row.open_basis_date = basis_raw
+        elif basis_raw:
+            try:
+                row.open_basis_date = date.fromisoformat(str(basis_raw)[:10])
+            except ValueError:
+                row.open_basis_date = prev_td
+        else:
+            row.open_basis_date = None
+        row.open_basis_stale = bool(basis.get("open_basis_stale"))
+        row.attribution = attr
+        tip = basis.get("open_basis_tip")
+        note_bits = [row.notes] if row.notes else []
+        if tip and tip not in (row.notes or ""):
+            note_bits.append(str(tip))
+        note_bits.append("历史 open_basis/attribution 已重算")
+        row.notes = " | ".join(x for x in note_bits if x)
+        touched.append(row.trade_date.isoformat())
+    if touched:
+        db.flush()
+    return touched
 
 
 def list_settlements(db: Session, *, limit: int = 30) -> dict[str, Any]:
@@ -673,20 +1334,23 @@ def get_settlement(db: Session, trade_date: date | None = None) -> dict[str, Any
 
 
 def settle_day(db: Session, *, agent_run_id: int | None = None) -> dict[str, Any]:
-    """日终清算：按最新行情估值、写入快照与每日清算记录，并汇总当日盈亏/持仓/成交。"""
+    """日终清算：收盘价估值、补齐缺日清算、写入当日清算与归因。"""
     from evo_api.services.market_session import require_review_window
 
     require_review_window()
-    view = portfolio_view(db)
-    snap = take_snapshot(db)
     today = desk_today(db)
+    trade_date = date.fromisoformat(str(today["date"]))
+    backfilled = ensure_prior_settlements(db, trade_date)
+    # 补日后重新取日初基准，再用收盘价估值当日
+    view = portfolio_view(db, mark_mode="close", as_of=trade_date)
+    snap = take_snapshot(db)
     settlement = upsert_settlement(
         db,
         view=view,
         snap=snap,
         today=today,
         agent_run_id=agent_run_id,
-        notes="日终清算",
+        notes="日终清算（收盘价）",
     )
     return {
         "settled": True,
@@ -697,6 +1361,12 @@ def settle_day(db: Session, *, agent_run_id: int | None = None) -> dict[str, Any
         "close_equity": settlement.close_equity,
         "open_cash": settlement.open_cash,
         "close_cash": settlement.close_cash,
+        "open_basis_date": settlement.open_basis_date.isoformat()
+        if settlement.open_basis_date
+        else None,
+        "open_basis_stale": bool(settlement.open_basis_stale),
+        "attribution": settlement.attribution,
+        "backfilled_dates": backfilled,
         "cash": view["cash"],
         "equity": view["equity"],
         "day_start_equity": view["day_start_equity"],
@@ -791,10 +1461,19 @@ def submit_order(
     quantity: float,
     decision_id: int | None = None,
     agent_run_id: int | None = None,
+    rationale: str | None = None,
+    confidence: float | None = None,
+    verify: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from evo_api.services.trade_verify import add_trading_days, parse_order_evidence
+
     symbol = symbol.strip().upper().replace(".SH", "").replace(".SZ", "")
     digits = "".join(ch for ch in symbol if ch.isdigit())
     symbol = digits[-6:] if len(digits) >= 6 else symbol
+
+    evidence = parse_order_evidence(
+        rationale=rationale, confidence=confidence, verify=verify
+    )
 
     kind = instrument_kind(symbol)
     if kind is None:
@@ -829,6 +1508,10 @@ def submit_order(
     commission = max(notional * commission_rate, min_commission)
 
     now = market_session_svc.now_cn()
+    trade_day = now.date()
+    due_date = add_trading_days(
+        trade_day, int(evidence["verify_spec"]["horizon_days"])
+    )
     order = Order(
         decision_id=decision_id,
         agent_run_id=agent_run_id,
@@ -836,6 +1519,9 @@ def submit_order(
         side=OrderSide(side),
         quantity=quantity,
         status=OrderStatus.filled,
+        rationale=evidence["rationale"],
+        confidence=evidence["confidence"],
+        verify_spec=evidence["verify_spec"],
         created_at=now,
     )
 
@@ -875,6 +1561,11 @@ def submit_order(
         quantity=quantity,
         price=price,
         commission=commission,
+        rationale=evidence["rationale"],
+        confidence=evidence["confidence"],
+        verify_spec=evidence["verify_spec"],
+        verify_due_date=due_date,
+        verify_status="pending",
         created_at=now,
     )
     db.add(trade)
@@ -886,6 +1577,11 @@ def submit_order(
         "trade_id": trade.id,
         "price": price,
         "commission": commission,
+        "rationale": trade.rationale,
+        "confidence": trade.confidence,
+        "verify_spec": trade.verify_spec,
+        "verify_due_date": due_date.isoformat(),
+        "verify_status": trade.verify_status,
         "snapshot_id": snap.id,
         "portfolio": portfolio_view(db),
     }
@@ -939,6 +1635,9 @@ def _decision_payload(
                 "quantity": o.quantity,
                 "status": o.status.value,
                 "reason": o.reason,
+                "rationale": o.rationale,
+                "confidence": o.confidence,
+                "verify_spec": o.verify_spec,
                 "created_at": o.created_at.isoformat() if o.created_at else None,
                 "price": trade_by_order[o.id].price if o.id in trade_by_order else None,
                 "commission": (

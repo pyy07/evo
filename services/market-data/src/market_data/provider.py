@@ -10,7 +10,66 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable
+
+_BREADTH_CACHE_DIR = Path(
+    os.environ.get("EVO_BREADTH_CACHE")
+    or (Path.home() / ".cache" / "evo-market" / "breadth")
+).expanduser()
+
+
+def _breadth_cache_path(trade_date: str) -> Path:
+    return _BREADTH_CACHE_DIR / f"{trade_date}.json"
+
+
+def _persist_breadth_day(day_row: dict[str, Any]) -> None:
+    trade_date = str(day_row.get("trade_date") or "")[:10]
+    if not trade_date:
+        return
+    try:
+        _BREADTH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _breadth_cache_path(trade_date)
+        payload = dict(day_row)
+        payload["persisted_at"] = datetime.now().isoformat(timespec="seconds")
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _load_breadth_history(days: int, *, today: str) -> list[dict[str, Any]]:
+    """从本地日终缓存读取近 N 个交易日宽度（按文件名日期倒序）。"""
+    days = max(1, min(int(days), 30))
+    rows: list[dict[str, Any]] = []
+    try:
+        files = sorted(_BREADTH_CACHE_DIR.glob("????-??-??.json"), reverse=True)
+    except OSError:
+        files = []
+    for path in files:
+        if len(rows) >= days:
+            break
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        td = str(data.get("trade_date") or path.stem)[:10]
+        if td > today:
+            continue
+        rows.append(
+            {
+                "trade_date": td,
+                "up": data.get("up"),
+                "down": data.get("down"),
+                "flat": data.get("flat"),
+                "limit_up_total": data.get("limit_up_total"),
+                "limit_down_total": data.get("limit_down_total"),
+                "down_over_5pct": data.get("down_over_5pct"),
+                "up_over_5pct": data.get("up_over_5pct"),
+                "as_of": data.get("as_of"),
+            }
+        )
+    rows.sort(key=lambda r: str(r.get("trade_date") or ""))
+    return rows
 
 
 class MarketDataError(Exception):
@@ -176,8 +235,170 @@ def _compact_board_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any
             item["up_count"] = row.get("up_count")
         if row.get("down_count") is not None:
             item["down_count"] = row.get("down_count")
+        if row.get("member_count") is not None:
+            item["member_count"] = row.get("member_count")
+        if row.get("low_sample") is not None:
+            item["low_sample"] = row.get("low_sample")
         out.append(item)
     return out
+
+
+def _breadth_aggregates(histogram: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """从 ZDFenBu 直方图汇总涨跌停等聚合字段。±10 档口径含 ≥10%（20cm/北交所）。"""
+    limit_up = limit_down = down_over_9 = up_over_9 = down_over_5 = up_over_5 = 0
+    for item in histogram or []:
+        key = str(item.get("bucket") or "")
+        try:
+            n = int(item.get("count") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        try:
+            bucket = float(key)
+        except ValueError:
+            continue
+        if bucket <= -10:
+            limit_down += n
+        if bucket >= 10:
+            limit_up += n
+        if bucket <= -9:
+            down_over_9 += n
+        if bucket >= 9:
+            up_over_9 += n
+        if bucket <= -5:
+            down_over_5 += n
+        if bucket >= 5:
+            up_over_5 += n
+    return {
+        "limit_up_total": limit_up,
+        "limit_down_total": limit_down,
+        "down_over_9pct_total": down_over_9,
+        "up_over_9pct_total": up_over_9,
+        "down_over_5pct": down_over_5,
+        "up_over_5pct": up_over_5,
+        "bucket_note": "±10 档为涨跌幅≥10%家数（含20cm/新股/北交所），非仅一字板",
+    }
+
+
+def _overview_board_section(
+    ranked: dict[str, Any] | None,
+    *,
+    top_n: int,
+    side: str,
+    min_member_count: int,
+) -> dict[str, Any]:
+    """概览行业/概念主榜：不把小样本填进主榜，原始前列放 raw_*。"""
+    key = "top" if side in ("leaders", "hot") else "bottom"
+    raw_key = "raw_leaders" if side in ("leaders", "hot") else "raw_laggards"
+    rows = list((ranked or {}).get(key) or [])
+    raw = _compact_board_rows(rows[:top_n])
+    kept = [r for r in rows if not r.get("low_sample")]
+    main = _compact_board_rows(kept[:top_n])
+    low_sample = len(main) < min(3, top_n) and bool(rows)
+    return {
+        side: main,
+        raw_key: raw,
+        "total": (ranked or {}).get("total", 0),
+        "min_member_count": min_member_count,
+        "low_sample": low_sample,
+        "filtered_reason": (
+            f"主榜仅 member_count>={min_member_count}；不足未用小样本回填，见 {raw_key}"
+            if low_sample or len(main) < len(raw)
+            else None
+        ),
+    }
+
+
+_SHARE_CAUSE_KEYWORDS = (
+    ("split", ("份额折算", "基金份额折算", "拆分", "分拆")),
+    ("merge", ("合并", "吸收合并", "基金合并")),
+    ("transfer", ("转托管", "联接基金", "份额结转")),
+    ("dividend", ("红利再投", "分红再投资", "收益分配")),
+)
+
+
+def _classify_share_cause_from_titles(
+    titles: list[str],
+) -> tuple[str, str | None, dict[str, Any] | None]:
+    blob = " ".join(titles)
+    for cause, keys in _SHARE_CAUSE_KEYWORDS:
+        hit = next((k for k in keys if k in blob), None)
+        if hit:
+            return cause, "medium", {"matched": hit}
+    if any(k in blob for k in ("申购", "赎回", "净申购", "净赎回")):
+        return "cash_flow", "low", {"matched": "申购/赎回字样"}
+    return "unknown", "low", None
+
+
+def _share_direction_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """按跟踪指数聚合份额同向性；异常变动尝试挂公告原因。"""
+    by_index: dict[str, list[dict[str, Any]]] = {}
+    abnormal: list[dict[str, Any]] = []
+    for it in items:
+        code = str(it.get("code") or "")
+        index_code = _ETF_TO_INDEX.get(code)
+        it["index_code"] = index_code
+        pct = it.get("share_change_pct")
+        tech_flag = None
+        tech_reason = (
+            "优先看 cause/announcement；无公告时仅作跨产品同向汇总，"
+            "极端单日跃升勿直接当资金底。"
+        )
+        try:
+            pct_f = float(pct) if pct is not None else None
+        except (TypeError, ValueError):
+            pct_f = None
+        cause = it.get("cause") or "unknown"
+        cause_conf = it.get("cause_confidence") or "low"
+        if pct_f is not None and abs(pct_f) >= 2.0:
+            if cause == "unknown":
+                tech_flag = "suspect_needs_announcement_check"
+            abnormal.append(
+                {
+                    "code": code,
+                    "share_change_pct": pct_f,
+                    "estimated_net_flow": it.get("estimated_net_flow"),
+                    "cause": cause,
+                    "cause_confidence": cause_conf,
+                    "announcement": it.get("announcement"),
+                }
+            )
+        it["technical_adjustment_flag"] = tech_flag
+        it["technical_adjustment_reason"] = tech_reason
+        it["technical_adjustment_confidence"] = cause_conf
+        if not index_code or pct_f is None:
+            continue
+        by_index.setdefault(index_code, []).append(
+            {"code": code, "share_change_pct": pct_f, "estimated_net_flow": it.get("estimated_net_flow")}
+        )
+    groups: list[dict[str, Any]] = []
+    for index_code, rows in sorted(by_index.items()):
+        if len(rows) < 2:
+            continue
+        ups = [r for r in rows if r["share_change_pct"] > 0]
+        downs = [r for r in rows if r["share_change_pct"] < 0]
+        majority = ups if len(ups) >= len(downs) else downs
+        same_ratio = round(len(majority) / len(rows), 3)
+        flows = [float(r["estimated_net_flow"]) for r in rows if r.get("estimated_net_flow") is not None]
+        div = [r["code"] for r in rows if (r["share_change_pct"] > 0) != (majority[0]["share_change_pct"] > 0)]
+        groups.append(
+            {
+                "index_code": index_code,
+                "product_count": len(rows),
+                "same_direction_ratio": same_ratio,
+                "direction": "up" if majority and majority[0]["share_change_pct"] > 0 else "down",
+                "total_est_net_flow": round(sum(flows), 2) if flows else None,
+                "divergence_codes": div,
+                "codes": [r["code"] for r in rows],
+            }
+        )
+    return {
+        "by_index": groups,
+        "abnormal": abnormal,
+        "note": (
+            "同向性仅基于 T+1 份额变动符号；|share_change_pct|≥2% 列入 abnormal，"
+            "cause 来自近期公告标题关键词（折算/合并/转托管/申赎），unknown 时勿当资金底。"
+        ),
+    }
 
 
 def _parse_zd_fenbu(fenbu: Any) -> list[dict[str, Any]]:
@@ -320,6 +541,7 @@ _CONCEPT_NOISE_NAME_KEYS = (
 # 常见宽基 ETF → 中证/国证指数（估值）
 _ETF_TO_INDEX = {
     "510300": "000300",
+    "510330": "000300",
     "159919": "000300",
     "510050": "000016",
     "510500": "000905",
@@ -334,6 +556,8 @@ _ETF_TO_INDEX = {
     "510880": "000015",
     "159905": "399324",
 }
+
+_DIVIDEND_INDEX_CODES = {"000015", "000922", "930955", "399324"}
 
 _MOCK_CB_UNIVERSE: list[dict[str, str]] = [
     {"code": "110059", "name": "浦发转债"},
@@ -607,13 +831,72 @@ class MarketDataProvider:
             )
         ranked.sort(key=lambda r: abs(float(r.get("change_pct") or 0.0)), reverse=True)
         top_n = max(5, min(int(top_n), 80))
+        candidates = ranked[:top_n]
+        candidates = self._enrich_screen_valuation(candidates, stock_type=stock_type)
         return {
             "stock_type": stock_type,
             "index_code": index_code if stock_type == "stock" else None,
             "universe_size": len(members),
             "index_quotes": index_quotes,
-            "candidates": ranked[:top_n],
+            "candidates": candidates,
+            "valuation_note": (
+                "ETF 候选已批量回填跟踪指数估值（pe_ttm/pb/股息率/分位）；"
+                "快照 pe_ttm/pb=0 已置 null，禁止当无估值或极低估。"
+                if stock_type == "etf"
+                else "个股/转债快照 pe_ttm/pb 为 0 或 '-' 时已置 null。"
+            ),
         }
+
+    def _enrich_screen_valuation(
+        self, candidates: list[dict[str, Any]], *, stock_type: str
+    ) -> list[dict[str, Any]]:
+        """筛选阶段估值：ETF join 指数估值；禁止用 0 占位。"""
+        # 先清洗快照 0/- 
+        for c in candidates:
+            for key in ("pe_ttm", "pb"):
+                val = c.get(key)
+                if val in (0, 0.0, "0", "-", "--", None, ""):
+                    c[key] = None
+                    c[f"{key}_status"] = "unavailable"
+                    c[f"{key}_reason"] = "snapshot_zero_or_dash"
+        if stock_type != "etf":
+            return candidates
+        cache: dict[str, dict[str, Any]] = {}
+        for c in candidates:
+            code = str(c.get("code") or "")
+            index_code = _ETF_TO_INDEX.get(code)
+            c["index_code"] = index_code
+            if not index_code:
+                c["valuation_status"] = "unmapped"
+                c["valuation_reason"] = "no_etf_to_index_mapping"
+                c["mapping_confidence"] = None
+                continue
+            if index_code not in cache:
+                try:
+                    cache[index_code] = self.get_index_valuation(index_code)
+                except Exception as exc:  # noqa: BLE001
+                    cache[index_code] = {"error": str(exc)[:200], "index_code": index_code}
+            val = cache[index_code]
+            if val.get("error") and val.get("pe_ttm") is None and val.get("pb") is None:
+                c["valuation_status"] = "unavailable"
+                c["valuation_reason"] = val.get("error")
+                c["mapping_confidence"] = "exact" if code in _ETF_TO_INDEX else None
+                continue
+            c["pe_ttm"] = val.get("pe_ttm")
+            c["pb"] = val.get("pb")
+            c["pb_status"] = val.get("pb_status")
+            c["dividend_yield_percent"] = val.get("dividend_yield_percent")
+            c["pe_percentile_1y"] = val.get("pe_percentile_1y")
+            c["pe_percentile_3y"] = val.get("pe_percentile_3y")
+            c["pe_percentile_5y"] = val.get("pe_percentile_5y")
+            c["valuation_as_of"] = val.get("as_of")
+            c["valuation_status"] = "ok" if val.get("pe_ttm") is not None or val.get("pb") is not None else "partial"
+            c["mapping_confidence"] = "exact"
+            c["pe_ttm_status"] = "ok" if c.get("pe_ttm") is not None else "unavailable"
+            if c.get("pb") is None:
+                c["pb_status"] = val.get("pb_status") or "unavailable"
+                c["pb_reason"] = val.get("pb_tip") or "index_pb_unavailable"
+        return candidates
 
     def _mock_universe(
         self, stock_type: str, seeds: list[dict[str, str]]
@@ -1226,10 +1509,12 @@ class MarketDataProvider:
         return number
 
     def get_index_valuation(self, code: str) -> dict[str, Any]:
-        """指数/宽基 ETF 估值：优先中证 PE/股息率，东财仅作名称补充。
+        """指数/宽基 ETF 估值：中证静态 PE + PE-TTM 长窗口分位 + 主指数 PB 快照。
 
-        说明：东财指数报价 pe/pb 常为 '-'；中证 indicator.xls 不含 PB。
-        pe_percentile 基于中证近期文件窗口（通常约 20 个交易日），不是全历史分位。
+        - pe / pe_percentile：中证 indicator.xls 近期静态 PE（约 20 日窗口分位）。
+        - pe_ttm / pe_percentile_1y|3y|5y：中证 indexCsiDsPe 滚动市盈率历史分位。
+        - pb：中证 data-service/indexValuation 当日快照（仅覆盖少数主指数）。
+        - pb_percentile_*：公开源无 PB 历史，保持 unavailable，绝不短窗冒充。
         """
         raw = "".join(ch for ch in str(code) if ch.isdigit())[-6:]
         if not raw:
@@ -1250,28 +1535,63 @@ class MarketDataProvider:
         }
         mapped_name = labels.get(index_code) or labels.get(raw) or index_code
         if self.mode == "mock":
+            today = date.today()
             return {
                 "code": raw,
                 "index_code": index_code,
                 "name": mapped_name,
                 "pe": 12.8,
-                "pe_ttm": 12.8,
-                "pb": None,
+                "pe_ttm": 12.5,
+                "pb": 1.35 if index_code in {"000300", "000015", "000016", "000905", "000922"} else None,
+                "pb_status": (
+                    "ok"
+                    if index_code in {"000300", "000015", "000016", "000905", "000922"}
+                    else "unavailable"
+                ),
+                "pb_source": (
+                    "csi_index_valuation_snapshot"
+                    if index_code in {"000300", "000015", "000016", "000905", "000922"}
+                    else None
+                ),
+                "pb_percentile_1y": None,
+                "pb_percentile_3y": None,
+                "pb_percentile_status": "unavailable",
                 "pe_percentile": 42.0,
                 "pe_percentile_window": 20,
                 "pe_percentile_basis": "csi_recent_file",
-                "pe_percentile_window_start": (date.today() - timedelta(days=30)).isoformat(),
-                "pe_percentile_window_end": date.today().isoformat(),
-                "pe_percentile_1y": None,
-                "pe_percentile_3y": None,
-                "pb": None,
-                "pb_status": "unavailable",
+                "pe_percentile_window_start": (today - timedelta(days=30)).isoformat(),
+                "pe_percentile_window_end": today.isoformat(),
+                "pe_percentile_1y": 35.0,
+                "pe_percentile_3y": 48.0,
+                "pe_percentile_5y": 52.0,
+                "pe_percentile_1y_sample_size": 240,
+                "pe_percentile_3y_sample_size": 720,
+                "pe_percentile_5y_sample_size": 1200,
+                "pe_percentile_1y_window_start": (today - timedelta(days=365)).isoformat(),
+                "pe_percentile_1y_window_end": today.isoformat(),
+                "pe_percentile_3y_window_start": (today - timedelta(days=365 * 3)).isoformat(),
+                "pe_percentile_3y_window_end": today.isoformat(),
+                "pe_percentile_5y_window_start": (today - timedelta(days=365 * 5)).isoformat(),
+                "pe_percentile_5y_window_end": today.isoformat(),
+                "pe_percentile_long_basis": "csi_pe_ttm_history",
                 "dividend_yield_percent": 2.5,
-                "as_of": date.today().isoformat(),
+                "dy_percentile_1y": 55.0,
+                "dy_percentile_3y": 48.0,
+                "dy_percentile_5y": 42.0,
+                "dy_percentile_basis": "csi_indicator_mock",
+                "dy_series": [],
+                "as_of": today.isoformat(),
                 "degraded": False,
+                "caveat": (
+                    "PE 分位受成分调整与盈利周期影响，不得单独作为高估判据；"
+                    "红利/高股息指数应以股息率+PB 双锚判定。"
+                    if index_code in _DIVIDEND_INDEX_CODES
+                    else None
+                ),
                 "note": (
                     "ETF 快照 pe_ttm/pb 常为 0/-，请用本能力。"
-                    "PB 中证未提供；pe_percentile 仅为中证近期文件窗口分位，非 1年/3年/全历史。"
+                    "pe_percentile 为近期静态 PE 窗口；pe_percentile_1y/3y/5y 为 PE-TTM 历史分位。"
+                    "dy_percentile_* 来自中证 indicator 股息率序列；pb 历史分位暂无公开同源。"
                 ),
                 "source": "mock",
             }
@@ -1283,6 +1603,10 @@ class MarketDataProvider:
             "pe_ttm": None,
             "pb": None,
             "pb_status": "unavailable",
+            "pb_source": None,
+            "pb_percentile_1y": None,
+            "pb_percentile_3y": None,
+            "pb_percentile_status": "unavailable",
             "pe_percentile": None,
             "pe_percentile_window": None,
             "pe_percentile_basis": None,
@@ -1290,18 +1614,33 @@ class MarketDataProvider:
             "pe_percentile_window_end": None,
             "pe_percentile_1y": None,
             "pe_percentile_3y": None,
+            "pe_percentile_5y": None,
+            "pe_percentile_long_basis": None,
             "dividend_yield_percent": None,
+            "dy_percentile_1y": None,
+            "dy_percentile_3y": None,
+            "dy_percentile_5y": None,
+            "dy_percentile_basis": None,
+            "dy_series": None,
             "as_of": None,
             "degraded": False,
+            "caveat": (
+                "PE 分位受成分调整与盈利周期影响，不得单独作为高估判据；"
+                "红利/高股息指数应以股息率+PB 双锚判定。"
+                if index_code in _DIVIDEND_INDEX_CODES
+                else None
+            ),
             "note": (
                 "ETF/指数快照 pe_ttm、pb 常为 0 或 '-'；"
-                "PE 与股息率来自中证近期估值文件。"
-                "pb_status=unavailable（中证 indicator.xls 无 PB）；"
-                "pe_percentile 仅为该文件近期窗口分位，1y/3y 全历史分位暂无同源数据。"
+                "pe 为中证近期文件静态 PE；pe_ttm 与 pe_percentile_1y/3y/5y 来自中证滚动市盈率历史；"
+                "pe_percentile 仅为近期静态窗口，勿当作中长期分位；"
+                "dy_percentile_* 来自中证 indicator 股息率序列（与静态 PE 同源）；"
+                "pb 来自中证主指数当日快照（覆盖有限）；pb 历史分位暂无公开同源；"
                 "name 优先本地映射，东财 ulist 仅作补充；ulist 失败标 degraded，不把代码当名称。"
             ),
             "source": None,
         }
+        sources: list[str] = []
         try:
             rows = self._eastmoney_ulist(
                 [self._index_secid(index_code)],
@@ -1317,14 +1656,12 @@ class MarketDataProvider:
                     out["name"] = em_name
                 pe = self._num_or_none(row.get("f9"))
                 pe_ttm = self._num_or_none(row.get("f115")) or pe
-                pb = self._num_or_none(row.get("f23"))
                 if pe is not None:
                     out["pe"] = pe
                 if pe_ttm is not None:
                     out["pe_ttm"] = pe_ttm
-                if pb is not None:
-                    out["pb"] = pb
-                out["source"] = "eastmoney_ulist"
+                # 东财指数 pb 常为 0/-，不作主源；PB 留给中证快照
+                sources.append("eastmoney_ulist")
         except Exception as exc:  # noqa: BLE001
             out["ulist_error"] = str(exc)[:300]
             out["degraded"] = True
@@ -1345,7 +1682,9 @@ class MarketDataProvider:
                     latest = pes[-1]
                     out["csi_pe"] = latest
                     out["pe"] = latest
-                    out["pe_ttm"] = latest
+                    # pe_ttm 稍后由 PE-TTM 历史覆盖；此处先占位避免空值
+                    if out.get("pe_ttm") is None:
+                        out["pe_ttm"] = latest
                     out["pe_percentile"] = round(
                         sum(1 for x in pes if x <= latest) / len(pes) * 100, 1
                     )
@@ -1354,26 +1693,138 @@ class MarketDataProvider:
                     dates = [str(r.get("date") or "") for r in recs if r.get("date")]
                     out["pe_percentile_window_start"] = dates[0] if dates else None
                     out["pe_percentile_window_end"] = dates[-1] if dates else None
-                    # 显式占位：避免 Agent 把近期窗口误当成 1年/全历史分位
-                    out["pe_percentile_1y"] = None
-                    out["pe_percentile_3y"] = None
                     last = recs[-1]
                     out["as_of"] = last.get("date")
                     out["dividend_yield_percent"] = self._num_or_none(
                         last.get("dividend_yield_calculation_percent")
                     )
                     out["pe_total"] = self._num_or_none(last.get("pe_total"))
-                    out["source"] = (
-                        "csi+eastmoney_ulist" if out.get("source") else "csi"
-                    )
+                    sources.append("csi_indicator")
+                    # 股息率历史分位（同源 indicator 序列）
+                    try:
+                        dy_hist = [
+                            {
+                                "date": r.get("date"),
+                                "dividend_yield": self._num_or_none(
+                                    r.get("dividend_yield_calculation_percent")
+                                ),
+                            }
+                            for r in recs
+                            if self._num_or_none(
+                                r.get("dividend_yield_calculation_percent")
+                            )
+                            is not None
+                        ]
+                        if dy_hist:
+                            # indicator 文件窗口较短：放宽 min_samples
+                            dy_pct = asd_core.series_window_percentiles(
+                                dy_hist,
+                                value_key="dividend_yield",
+                                prefix="dy_percentile",
+                                min_samples=8,
+                                basis="csi_indicator_dividend_yield",
+                                data_source="csi_indicator.xls",
+                            )
+                            out["dividend_yield_percent"] = dy_pct.get("dividend_yield")
+                            out["dy_percentile_1y"] = dy_pct.get("dy_percentile_1y")
+                            out["dy_percentile_3y"] = dy_pct.get("dy_percentile_3y")
+                            out["dy_percentile_5y"] = dy_pct.get("dy_percentile_5y")
+                            out["dy_percentile_basis"] = dy_pct.get("dy_percentile_basis")
+                            out["dy_series"] = dy_pct.get("series")
+                            for label in ("1y", "3y", "5y"):
+                                for suffix in (
+                                    "window_start",
+                                    "window_end",
+                                    "sample_size",
+                                    "status",
+                                ):
+                                    k = f"dy_percentile_{label}_{suffix}"
+                                    if dy_pct.get(k) is not None or suffix == "status":
+                                        out[k] = dy_pct.get(k)
+                            sources.append("csi_dy_history")
+                    except Exception as dy_exc:  # noqa: BLE001
+                        out["dy_history_error"] = str(dy_exc)[:200]
         except Exception as exc:  # noqa: BLE001
             out["csi_error"] = str(exc)[:300]
-        if out.get("pe") is None and out.get("pb") is None:
-            out["error"] = out.get("csi_error") or out.get("ulist_error") or "valuation empty"
+
+        # 长窗口 PE-TTM 分位（中证官网历史序列）
+        try:
+            from market_data import asd_core
+
+            hist = asd_core.index_pe_ttm_history(index_code)
+            pct = asd_core.pe_ttm_window_percentiles(hist)
+            out["pe_ttm"] = pct.get("pe_ttm")
+            out["pe_percentile_1y"] = pct.get("pe_percentile_1y")
+            out["pe_percentile_3y"] = pct.get("pe_percentile_3y")
+            out["pe_percentile_5y"] = pct.get("pe_percentile_5y")
+            out["pe_percentile_long_basis"] = pct.get("pe_percentile_long_basis")
+            for label in ("1y", "3y", "5y"):
+                out[f"pe_percentile_{label}_window_start"] = pct.get(
+                    f"pe_percentile_{label}_window_start"
+                )
+                out[f"pe_percentile_{label}_window_end"] = pct.get(
+                    f"pe_percentile_{label}_window_end"
+                )
+                out[f"pe_percentile_{label}_sample_size"] = pct.get(
+                    f"pe_percentile_{label}_sample_size"
+                )
+            if pct.get("as_of"):
+                out["pe_ttm_as_of"] = pct["as_of"]
+                if not out.get("as_of"):
+                    out["as_of"] = pct["as_of"]
+            sources.append("csi_pe_ttm_history")
+        except Exception as exc:  # noqa: BLE001
+            out["pe_ttm_history_error"] = str(exc)[:300]
+            out["pe_percentile_1y"] = None
+            out["pe_percentile_3y"] = None
+            out["pe_percentile_5y"] = None
+
+        # 主指数当日 PB（中证快照；覆盖有限）
+        try:
+            from market_data import asd_core
+
+            snap = asd_core.index_valuation_snapshots().get(index_code)
+            if snap and snap.get("pb") is not None:
+                out["pb"] = snap["pb"]
+                out["pb_status"] = "ok"
+                out["pb_source"] = snap.get("source") or "csi_index_valuation_snapshot"
+                if snap.get("as_of"):
+                    out["pb_as_of"] = snap["as_of"]
+                if out.get("dividend_yield_percent") is None and snap.get(
+                    "dividend_yield_percent"
+                ) is not None:
+                    out["dividend_yield_percent"] = snap["dividend_yield_percent"]
+                if out.get("pe") is None and snap.get("pe") is not None:
+                    out["pe"] = snap["pe"]
+                if snap.get("pe_ttm") is not None:
+                    # 快照 TTM 与历史序列应一致；历史失败时用快照兜底
+                    if out.get("pe_ttm") is None:
+                        out["pe_ttm"] = snap["pe_ttm"]
+                sources.append("csi_pb_snapshot")
+            elif snap is None:
+                out["pb_status"] = "unavailable"
+                out["pb_tip"] = (
+                    "该指数不在中证主指数估值快照覆盖内（常见：中证1000 等）；"
+                    "pb 历史分位亦无公开同源。"
+                )
+        except Exception as exc:  # noqa: BLE001
+            out["pb_snapshot_error"] = str(exc)[:300]
+            out["pb_status"] = "unavailable"
+
+        out["source"] = "+".join(dict.fromkeys(sources)) if sources else None
+        if out.get("pe") is None and out.get("pb") is None and out.get("pe_ttm") is None:
+            out["error"] = (
+                out.get("csi_error")
+                or out.get("pe_ttm_history_error")
+                or out.get("ulist_error")
+                or "valuation empty"
+            )
         return out
 
-    def get_market_breadth(self) -> dict[str, Any]:
-        """全市场涨跌家数 + 涨跌幅分布直方图。"""
+    def get_market_breadth(self, *, days: int = 1) -> dict[str, Any]:
+        """全市场涨跌家数 + 聚合字段；每次调用落盘当日快照，days>1 读本地历史。"""
+        days = max(1, min(int(days), 30))
+        as_of = datetime.now().isoformat(timespec="minutes")
         if self.mode == "mock":
             hist = [
                 {"bucket": "-11", "label": "跌停", "count": 8},
@@ -1385,13 +1836,50 @@ class MarketDataProvider:
                 {"bucket": "11", "label": "涨停", "count": 22},
             ]
             up, down, flat = 900, 700, 180
+            agg = _breadth_aggregates(hist)
+            today = date.today().isoformat()
+            day_row = {
+                "trade_date": today,
+                "as_of": as_of,
+                "up": up,
+                "down": down,
+                "flat": flat,
+                **agg,
+            }
+            _persist_breadth_day(day_row)
+            # mock：补近几天合成历史，便于测连续 N 日红线
+            if days > 1:
+                for i in range(1, days):
+                    d = (date.today() - timedelta(days=i)).isoformat()
+                    if (date.today() - timedelta(days=i)).weekday() >= 5:
+                        continue
+                    synth = {
+                        "trade_date": d,
+                        "as_of": f"{d}T15:05",
+                        "up": up - i * 10,
+                        "down": down + i * 8,
+                        "flat": flat,
+                        "limit_up_total": max(0, 22 - i),
+                        "limit_down_total": 8 + i * 3,
+                        "down_over_5pct": 200 + i * 20,
+                        "up_over_5pct": 100,
+                    }
+                    _persist_breadth_day(synth)
+            history = _load_breadth_history(days, today=today)
             return {
+                "as_of": as_of,
+                "trade_date": today,
                 "up": up,
                 "down": down,
                 "flat": flat,
                 "total": up + down + flat,
                 "bias": "偏强",
                 "histogram": hist,
+                **agg,
+                "history": history,
+                "history_status": "ok" if len(history) >= min(days, 2) or days == 1 else "partial",
+                "history_reason": None,
+                "history_source": "local_cache",
                 "source": "mock",
             }
         degraded: list[dict[str, str]] = []
@@ -1437,21 +1925,76 @@ class MarketDataProvider:
             raise MarketDataError("market breadth empty: " + str(degraded))
         total = up + down + flat
         bias = "偏强" if up > down * 1.05 else ("偏弱" if down > up * 1.05 else "均衡")
+        agg = _breadth_aggregates(histogram)
+        today = date.today().isoformat()
+        day_row = {
+            "trade_date": today,
+            "as_of": as_of,
+            "up": up,
+            "down": down,
+            "flat": flat,
+            **{k: agg[k] for k in (
+                "limit_up_total",
+                "limit_down_total",
+                "down_over_5pct",
+                "up_over_5pct",
+                "down_over_9pct_total",
+                "up_over_9pct_total",
+            )},
+        }
+        _persist_breadth_day(day_row)
+        history = _load_breadth_history(days, today=today)
+        # 保证今日在列
+        if not any(str(h.get("trade_date")) == today for h in history):
+            history.append(
+                {
+                    "trade_date": today,
+                    "up": up,
+                    "down": down,
+                    "flat": flat,
+                    "limit_up_total": agg.get("limit_up_total"),
+                    "limit_down_total": agg.get("limit_down_total"),
+                    "down_over_5pct": agg.get("down_over_5pct"),
+                    "up_over_5pct": agg.get("up_over_5pct"),
+                    "as_of": as_of,
+                }
+            )
+            history.sort(key=lambda r: str(r.get("trade_date") or ""))
+        hist_status = "ok"
+        hist_reason = None
+        if days > 1 and len(history) < days:
+            hist_status = "partial"
+            hist_reason = (
+                f"本地仅缓存 {len(history)}/{days} 日；"
+                "无公开 ZDFenBu 回溯，连续调用/盘后会继续累积。"
+                f"缓存目录={_BREADTH_CACHE_DIR}"
+            )
         return {
+            "as_of": as_of,
+            "trade_date": today,
             "up": up,
             "down": down,
             "flat": flat,
             "total": total,
             "bias": bias,
             "histogram": histogram,
+            **agg,
+            "history": history[-days:],
+            "history_status": hist_status,
+            "history_reason": hist_reason,
+            "history_source": "local_cache",
             "degraded": degraded,
             "source": "eastmoney getTopicZDFenBu + ulist",
         }
 
-    def get_market_overview(self, *, top_n: int = 8) -> dict[str, Any]:
+    def get_market_overview(
+        self, *, top_n: int = 8, min_member_count: int = 5
+    ) -> dict[str, Any]:
         """大盘综合：指数 + 行业/概念 + 资金流 + 估值/涨跌分布；单分项失败则降级。"""
         try:
-            return self._get_market_overview(top_n=top_n)
+            return self._get_market_overview(
+                top_n=top_n, min_member_count=min_member_count
+            )
         except Exception as exc:  # noqa: BLE001
             return {
                 "as_of": datetime.now().isoformat(timespec="seconds"),
@@ -1464,8 +2007,11 @@ class MarketDataProvider:
                 "error": str(exc)[:400],
             }
 
-    def _get_market_overview(self, *, top_n: int = 8) -> dict[str, Any]:
+    def _get_market_overview(
+        self, *, top_n: int = 8, min_member_count: int = 5
+    ) -> dict[str, Any]:
         top_n = max(3, min(int(top_n), 15))
+        min_member_count = max(1, min(int(min_member_count), 50))
         index_codes = ["sh000001", "sz399001", "sh000016", "sh000300", "sz399006"]
         index_labels = {
             "000001": "上证指数",
@@ -1497,13 +2043,23 @@ class MarketDataProvider:
 
         degraded: list[dict[str, str]] = []
         industry, err = self._try_section(
-            "industry_comparison", lambda: self.industry_comparison(top_n=top_n, board="industry")
+            "industry_comparison",
+            lambda: self.industry_comparison(
+                top_n=max(top_n * 2, 12),
+                board="industry",
+                min_member_count=min_member_count,
+            ),
         )
         if err:
             degraded.append(err)
             industry = {"top": [], "bottom": [], "total": 0}
         concept, err = self._try_section(
-            "concept_comparison", lambda: self.industry_comparison(top_n=top_n, board="concept")
+            "concept_comparison",
+            lambda: self.industry_comparison(
+                top_n=max(top_n * 2, 12),
+                board="concept",
+                min_member_count=min_member_count,
+            ),
         )
         if err:
             degraded.append(err)
@@ -1515,7 +2071,8 @@ class MarketDataProvider:
         if err:
             degraded.append(err)
             fund = {"inflow": [], "outflow": []}
-        breadth, err = self._try_section("market_breadth", self.get_market_breadth)
+        # 与 get_market_breadth 共用同一次取数结果，避免同日多口径
+        breadth, err = self._try_section("market_breadth", lambda: self.get_market_breadth(days=1))
         if err:
             degraded.append(err)
             breadth = None
@@ -1547,7 +2104,6 @@ class MarketDataProvider:
 
         industry_leaders = _dedupe_board_rows(industry.get("top"))
         industry_laggards = _dedupe_board_rows(industry.get("bottom"))
-        # industry_comparison(concept) 已过滤噪声；此处再兜底一遍并汇总计数
         concept_hot = _dedupe_board_rows(
             [r for r in (concept.get("top") or []) if not _is_concept_noise(r)]
         )
@@ -1561,7 +2117,6 @@ class MarketDataProvider:
                 for r in (concept.get("top") or []) + (concept.get("bottom") or [])
                 if _is_concept_noise(r)
             ]
-        # 概览内资金流只保留少量摘要，避免 6k 截断；完整列表用 get_board_fund_flow
         flow_n = min(top_n, 4)
 
         hsgt, err = self._try_section("hsgt_flow", self.get_hsgt_flow)
@@ -1569,37 +2124,76 @@ class MarketDataProvider:
             degraded.append(err)
             hsgt = None
 
+        ind_lead = _overview_board_section(
+            {"top": industry_leaders, "total": industry.get("total", 0)},
+            top_n=top_n,
+            side="leaders",
+            min_member_count=min_member_count,
+        )
+        ind_lag = _overview_board_section(
+            {"bottom": industry_laggards, "total": industry.get("total", 0)},
+            top_n=top_n,
+            side="laggards",
+            min_member_count=min_member_count,
+        )
+        con_hot = _overview_board_section(
+            {"top": concept_hot, "total": concept.get("total", 0)},
+            top_n=top_n,
+            side="hot",
+            min_member_count=min_member_count,
+        )
+        con_cold = _overview_board_section(
+            {"bottom": concept_cold, "total": concept.get("total", 0)},
+            top_n=top_n,
+            side="cold",
+            min_member_count=min_member_count,
+        )
+
         gaps = ["尚无「大盘动态」文字快讯流"]
         if not breadth or not breadth.get("histogram"):
             gaps.insert(0, "涨跌分布直方图暂不可用，已降级")
         if not valuation:
             gaps.insert(0, "指数估值暂不可用，已降级")
         if valuation and valuation.get("pb_status") == "unavailable":
-            gaps.insert(0, "指数 PB 暂无同源数据（pb_status=unavailable）")
+            gaps.insert(
+                0,
+                "指数 PB 暂无快照覆盖或同源失败（pb_status=unavailable）；pb 历史分位仍不可用",
+            )
         if valuation and valuation.get("pe_percentile_1y") is None:
-            gaps.insert(0, "指数 1年/3年 PE 分位暂无同源数据，仅有近期窗口分位")
+            gaps.insert(0, "指数 1年/3年/5年 PE-TTM 分位暂不可用，仅有近期静态窗口分位")
+        elif valuation and valuation.get("pb_percentile_status") == "unavailable":
+            gaps.insert(0, "指数 PB 历史分位暂无公开同源（勿用近期 PE 分位替代）")
         if not hsgt:
             gaps.insert(0, "北向/沪深港通资金暂不可用")
         elif hsgt.get("usable_for_style") is False:
             gaps.insert(0, "北向净买入不可用（仅有成交额），不可作外资风格验证")
+        if breadth and breadth.get("history_status") == "unavailable":
+            gaps.insert(0, "市场宽度多日历史暂不可用，连续 N 日红线无法工具验证")
 
         return {
-            "as_of": datetime.now().isoformat(timespec="seconds"),
+            "as_of": (breadth or {}).get("as_of")
+            or datetime.now().isoformat(timespec="seconds"),
             "indices": indices,
             "index_valuation": valuation,
             "hsgt": hsgt,
             "industry": {
-                "leaders": _compact_board_rows(industry_leaders[:top_n]),
-                "laggards": _compact_board_rows(industry_laggards[:top_n]),
-                "total": industry.get("total", 0),
-                "note": "已按主层级去重（同名优先保留无Ⅱ/Ⅲ后缀）；laggards 为涨跌幅最弱端",
+                **ind_lead,
+                "laggards": ind_lag.get("laggards") or [],
+                "raw_laggards": ind_lag.get("raw_laggards") or [],
+                "note": (
+                    f"主榜 min_member_count>={min_member_count}，小样本不回填主榜；"
+                    "已按主层级去重；laggards 为涨跌幅最弱端"
+                ),
             },
             "concept": {
-                "hot": _compact_board_rows(concept_hot[:top_n]),
-                "cold": _compact_board_rows(concept_cold[:top_n]),
-                "total": concept.get("total", 0),
+                **con_hot,
+                "cold": con_cold.get("cold") or [],
+                "raw_laggards": con_cold.get("raw_laggards") or [],
                 "filtered_noise_count": len(filtered_noise),
-                "note": "已过滤打板/涨停/新高及季报预减/中报扭亏等统计标签",
+                "note": (
+                    f"主榜 min_member_count>={min_member_count}；"
+                    "已过滤打板/涨停/新高及季报预减/中报扭亏等统计标签"
+                ),
             },
             "industry_fund_flow": {
                 "period": "today",
@@ -1807,6 +2401,9 @@ class MarketDataProvider:
             item["estimated_net_flow"] = None
             item["share_as_of"] = share_as_of
             item["share_prev_as_of"] = share_prev_as_of
+            item["cause"] = "unknown"
+            item["cause_confidence"] = "low"
+            item["announcement"] = None
             return
         share = share_info.get("share")
         prev_share = share_info.get("prev_share")
@@ -1829,6 +2426,51 @@ class MarketDataProvider:
                 "share_usable_for_intraday": False,
             }
         )
+        self._attach_share_cause(item)
+
+    def _attach_share_cause(self, item: dict[str, Any]) -> None:
+        """对 |份额变动|≥2% 的条目尝试挂公告原因；失败则 cause=unknown。"""
+        code = str(item.get("code") or "")
+        try:
+            pct = float(item.get("share_change_pct")) if item.get("share_change_pct") is not None else None
+        except (TypeError, ValueError):
+            pct = None
+        item.setdefault("cause", "unknown")
+        item.setdefault("cause_confidence", "low")
+        item.setdefault("announcement", None)
+        if pct is None or abs(pct) < 2.0:
+            if pct is not None and abs(pct) < 2.0:
+                item["cause"] = "cash_create" if pct > 0 else "cash_redeem"
+                item["cause_confidence"] = "low"
+                item["cause_reason"] = "小幅变动默认按申赎近似，未核验公告"
+            return
+        if self.mode == "mock":
+            item["cause"] = "unknown"
+            item["cause_confidence"] = "low"
+            item["cause_reason"] = "mock：无公告真源"
+            item["announcement"] = None
+            return
+        try:
+            anns = self.get_announcements(codes=[code], days=20, limit=8)
+            rows = anns.get("items") or []
+        except Exception:  # noqa: BLE001
+            rows = []
+        titles = [str(r.get("title") or "") for r in rows]
+        cause, conf, meta = _classify_share_cause_from_titles(titles)
+        item["cause"] = cause
+        item["cause_confidence"] = conf
+        if cause == "unknown":
+            item["cause_reason"] = "近20日公告未匹配折算/合并/转托管关键词"
+        elif meta:
+            item["cause_reason"] = f"公告标题匹配「{meta.get('matched')}」"
+        if rows:
+            top = rows[0]
+            item["announcement"] = {
+                "title": top.get("title"),
+                "date": top.get("date"),
+                "url": top.get("url"),
+                "source": top.get("source"),
+            }
 
     def _etf_share_flow_bundle(
         self, codes: list[str], *, lookback_days: int = 12
@@ -1966,8 +2608,9 @@ class MarketDataProvider:
                 "share_as_of": share_as_of,
                 "share_prev_as_of": share_prev_as_of,
                 "share_usable_for_intraday": False,
+                "share_direction": _share_direction_summary(items),
                 "source": "mock",
-                "note": "mock：premium_pct 相对 IOPV；份额为 T+1 代理",
+                "note": "mock：premium_pct 相对 IOPV；份额为 T+1 代理；含跨产品同向性汇总",
             }
 
         url = (
@@ -2098,12 +2741,15 @@ class MarketDataProvider:
             "share_prev_as_of": share_prev_as_of,
             "share_usable_for_intraday": False,
             "share_gaps": share_bundle.get("gaps") or [],
+            "share_direction": _share_direction_summary(items),
             "note": (
                 "优先 premium_basis=iopv：东财 GSZ，空则回退腾讯行情 IOPV（iopv_source 标明）；"
                 "仍无 IOPV 时用已披露净值（常为 T-1）并标 nav_is_stale，"
                 "stale_adjusted_premium_pct=premium_pct-change_pct 剔除当日涨跌滞后。"
                 "份额来自沪深交易所 T+1 披露：share_change_status=t1_only，"
                 "estimated_net_flow≈份额变动×净值（元），不可用于盘中当日判断。"
+                "share_direction 按跟踪指数汇总同向性；technical_adjustment_flag 无公告真源，"
+                "极端跃升须核验折算/合并后再当资金底。"
             ),
             "source": "eastmoney FundMNFInfo + tencent IOPV fallback + SSE/SZSE ETF share",
         }
@@ -2822,25 +3468,40 @@ class MarketDataProvider:
         items: list[dict[str, Any]] = []
         degraded: list[dict[str, str]] = []
         per = max(5, min(20, limit // max(len(codes), 1) + 3))
+        sources_used: list[str] = []
         for code in codes:
+            rows: list[dict[str, Any]] = []
             try:
                 rows = news_mod.fetch_cninfo_announcements(
                     code, limit=per, max_chars=max_chars
                 )
-                if not rows:
-                    degraded.append(
-                        {
-                            "section": f"cninfo:{code}",
-                            "error": "巨潮无 orgId 映射或无公告（沪市部分 ETF 常见），未编造结果",
-                        }
-                    )
-                items.extend(r for r in rows if (r.get("date") or "") >= cutoff)
+                if rows:
+                    sources_used.append("cninfo")
             except Exception as exc:  # noqa: BLE001
                 degraded.append({"section": f"cninfo:{code}", "error": str(exc)[:300]})
+            if not rows:
+                try:
+                    rows = news_mod.fetch_eastmoney_fund_announcements(
+                        code, limit=per, max_chars=max_chars
+                    )
+                    if rows:
+                        sources_used.append("eastmoney_fund")
+                    else:
+                        degraded.append(
+                            {
+                                "section": f"ann:{code}",
+                                "error": "巨潮无 orgId 且东财基金公告为空，未编造结果",
+                            }
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    degraded.append(
+                        {"section": f"eastmoney_fund:{code}", "error": str(exc)[:300]}
+                    )
+            items.extend(r for r in rows if (r.get("date") or "") >= cutoff)
 
         items = sorted(items, key=lambda r: r.get("date") or "", reverse=True)[:limit]
         if not items and degraded and not any(
-            d.get("error", "").startswith("巨潮无 orgId") for d in degraded
+            "未编造" in d.get("error", "") for d in degraded
         ):
             raise MarketDataError("announcements empty: " + str(degraded))
         return {
@@ -2849,8 +3510,12 @@ class MarketDataProvider:
             "count": len(items),
             "items": items,
             "degraded": degraded,
-            "source": "cninfo",
-            "note": "无映射/无公告时 items 可为空并写入 degraded，不会返回假公告",
+            "sources_used": sorted(set(sources_used)),
+            "source": "+".join(sorted(set(sources_used))) or "cninfo|eastmoney_fund",
+            "note": (
+                "优先巨潮；沪市 ETF 无 orgId 时回退东财基金公告。"
+                "仍无结果时 items 可为空并写入 degraded，不会返回假公告"
+            ),
         }
 
     def get_macro_digest(
@@ -2862,6 +3527,10 @@ class MarketDataProvider:
         min_importance: int = 2,
         include_cctv: bool = True,
         max_chars: int = 300,
+        limit: int | None = 40,
+        slim: bool = False,
+        order_by: str = "importance_desc_time_asc",
+        kind: str | None = None,
     ) -> dict[str, Any]:
         """宏观日历（华尔街见闻）+ 可选新闻联播标题，供盘后/中长期判断。"""
         days_ahead = max(0, min(int(days_ahead), 30))
@@ -2871,15 +3540,32 @@ class MarketDataProvider:
         today = date.today()
         start = today - timedelta(days=days_back)
         end = today + timedelta(days=days_ahead)
+        from market_data import news as news_mod
+
         if self.mode == "mock":
+            raw_cal = self._mock_macro_calendar(start, end, min_importance)
+            prioritized = news_mod.prioritize_macro_calendar(
+                raw_cal,
+                limit=limit,
+                order_by=order_by,
+                slim=slim,
+                kind=kind,
+            )
             return {
                 "window": {"start": start.isoformat(), "end": end.isoformat()},
-                "calendar": self._mock_macro_calendar(start, end, min_importance),
+                "calendar": prioritized["items"],
+                "calendar_meta": {
+                    "truncated": prioritized["truncated"],
+                    "returned_count": prioritized["returned_count"],
+                    "total_count": prioritized["total_count"],
+                    "order_by": prioritized["order_by"],
+                    "window_start": prioritized["window_start"],
+                    "window_end": prioritized["window_end"],
+                    "next_cursor": prioritized["next_cursor"],
+                },
                 "cctv": self._mock_cctv(today - timedelta(days=1)) if include_cctv else [],
                 "source": "mock",
             }
-
-        from market_data import news as news_mod
 
         degraded: list[dict[str, str]] = []
         calendar: list[dict[str, Any]] = []
@@ -2892,6 +3578,14 @@ class MarketDataProvider:
             )
         except Exception as exc:  # noqa: BLE001
             degraded.append({"section": "macro_calendar", "error": str(exc)[:300]})
+
+        prioritized = news_mod.prioritize_macro_calendar(
+            calendar,
+            limit=limit,
+            order_by=order_by,
+            slim=slim,
+            kind=kind,
+        )
 
         cctv: list[dict[str, Any]] = []
         if include_cctv:
@@ -2909,11 +3603,20 @@ class MarketDataProvider:
                         {"section": f"cctv:{day.isoformat()}", "error": str(exc)[:300]}
                     )
 
-        if not calendar and not cctv and degraded:
+        if not prioritized["items"] and not cctv and degraded:
             raise MarketDataError("macro digest empty: " + str(degraded))
         return {
             "window": {"start": start.isoformat(), "end": end.isoformat()},
-            "calendar": calendar,
+            "calendar": prioritized["items"],
+            "calendar_meta": {
+                "truncated": prioritized["truncated"],
+                "returned_count": prioritized["returned_count"],
+                "total_count": prioritized["total_count"],
+                "order_by": prioritized["order_by"],
+                "window_start": prioritized["window_start"],
+                "window_end": prioritized["window_end"],
+                "next_cursor": prioritized["next_cursor"],
+            },
             "cctv": cctv,
             "degraded": degraded,
             "source": "wscn_macro+cctv",

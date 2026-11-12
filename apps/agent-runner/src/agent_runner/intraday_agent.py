@@ -56,15 +56,62 @@ FINALIZE_TOOL: dict[str, Any] = {
                 "action_plan": {"type": "string", "description": "行动计划"},
                 "orders": {
                     "type": "array",
-                    "description": "可选订单；无把握则为空数组",
+                    "description": (
+                        "可选订单；无把握则为空数组。"
+                        "有订单时每笔必须含 rationale/confidence/verify，否则拒单。"
+                    ),
                     "items": {
                         "type": "object",
                         "properties": {
                             "symbol": {"type": "string"},
                             "side": {"type": "string", "enum": ["buy", "sell"]},
                             "quantity": {"type": "number"},
+                            "rationale": {
+                                "type": "string",
+                                "description": "本笔决策依据（简体中文，引用工具证据）",
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "description": "信心指数 0–100",
+                            },
+                            "verify": {
+                                "type": "object",
+                                "description": "结构化验证条件，供盘后到期验收",
+                                "properties": {
+                                    "horizon_days": {"type": "integer"},
+                                    "metric": {
+                                        "type": "string",
+                                        "enum": [
+                                            "return_vs_cost",
+                                            "return_vs_benchmark",
+                                            "still_held",
+                                        ],
+                                    },
+                                    "op": {
+                                        "type": "string",
+                                        "enum": ["gte", "lte", "gt", "lt"],
+                                    },
+                                    "target": {"type": "number"},
+                                    "benchmark": {"type": "string"},
+                                    "summary": {"type": "string"},
+                                },
+                                "required": [
+                                    "horizon_days",
+                                    "metric",
+                                    "op",
+                                    "target",
+                                    "summary",
+                                ],
+                            },
                         },
-                        "required": ["symbol", "side", "quantity"],
+                        "required": [
+                            "symbol",
+                            "side",
+                            "quantity",
+                            "rationale",
+                            "confidence",
+                            "verify",
+                        ],
                     },
                 },
                 "usage_notes": {
@@ -141,6 +188,9 @@ def run_intraday_agent_loop(
             "个股/ETF 报价代码只能来自工具返回或持仓，不要使用固定主题 ETF 清单。\n"
             "finalize 时务必填写 usage_notes（缺工具/调用失败/需优化等；没有就 []），"
             "供盘后复盘沉淀经验与 CR。\n"
+            "若下单：每笔 orders[] 必须含 rationale、confidence(0-100)、verify"
+            "（horizon_days/metric/op/target/summary；"
+            "metric=return_vs_cost|return_vs_benchmark|still_held）。\n"
             "完成后必须调用 finalize_intraday_decision；"
             "不要直接调用 submit_observation/submit_decision/submit_order。"
         ),

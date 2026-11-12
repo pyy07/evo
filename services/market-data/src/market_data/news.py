@@ -251,20 +251,126 @@ def _cninfo_orgid(code: str) -> str | None:
         mapping: dict[str, str] = {}
         for url in (
             "http://www.cninfo.com.cn/new/data/szse_stock.json",
+            "http://www.cninfo.com.cn/new/data/sse_stock.json",
             "http://www.cninfo.com.cn/new/data/fund_stock.json",
+            # 部分 ETF 仅在基金列表
+            "http://www.cninfo.com.cn/new/data/fund_bond.json",
         ):
             try:
                 raw, _ = _request(url, timeout=15)
-                stock_list = json.loads(raw.decode("utf-8", "replace")).get("stockList") or []
+                payload = json.loads(raw.decode("utf-8", "replace"))
+                stock_list = payload.get("stockList") or payload.get("list") or []
                 for s in stock_list:
-                    c = str(s.get("code") or "").zfill(6)
-                    oid = s.get("orgId")
+                    if not isinstance(s, dict):
+                        continue
+                    c = str(s.get("code") or s.get("secCode") or "").zfill(6)[-6:]
+                    oid = s.get("orgId") or s.get("orgid")
                     if c and oid and c not in mapping:
                         mapping[c] = str(oid)
             except Exception:  # noqa: BLE001
                 continue
         _CNINFO_ORGID_MAP = mapping
     return _CNINFO_ORGID_MAP.get(code)
+
+
+def fetch_eastmoney_fund_announcements(
+    code: str, limit: int = 20, *, max_chars: int = 200
+) -> list[dict[str, Any]]:
+    """东财基金公告回退（沪市 ETF 巨潮无 orgId 时常用）。"""
+    code = "".join(ch for ch in code if ch.isdigit())[-6:]
+    if len(code) != 6:
+        return []
+    limit = max(1, min(int(limit), 50))
+    query = urllib.parse.urlencode(
+        {
+            "fundCode": code,
+            "pageIndex": "1",
+            "pageSize": str(limit),
+        }
+    )
+    ann_url = "https://api.fund.eastmoney.com/f10/JJGG?" + query
+    try:
+        raw, _ = _request(
+            ann_url,
+            timeout=15,
+            headers={
+                "Referer": f"https://fundf10.eastmoney.com/jjgg_{code}.html",
+                "User-Agent": UA,
+            },
+        )
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        # 备用：盘口资讯公告
+        try:
+            raw, _ = _request(
+                "https://np-anotice-fund.eastmoney.com/api/security/ann?"
+                + urllib.parse.urlencode(
+                    {
+                        "page_size": str(limit),
+                        "page_index": "1",
+                        "ann_type": "A",
+                        "client_source": "web",
+                        "stock_list": code,
+                        "f_node": "0",
+                        "s_node": "0",
+                    }
+                ),
+                timeout=15,
+                headers={"Referer": "https://fund.eastmoney.com/", "User-Agent": UA},
+            )
+            payload = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            return []
+    rows: list[dict[str, Any]] = []
+    # 兼容多种东财结构
+    items = (
+        payload.get("Data")
+        or payload.get("data")
+        or (payload.get("data") or {}).get("list")
+        or []
+    )
+    if isinstance(payload.get("data"), dict):
+        items = payload["data"].get("list") or payload["data"].get("items") or items
+    if not isinstance(items, list):
+        return []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = _strip_html(
+            item.get("TITLE")
+            or item.get("title")
+            or item.get("notice_title")
+            or item.get("art_title")
+            or ""
+        )
+        if not title:
+            continue
+        d = (
+            str(
+                item.get("NOTICE_DATE")
+                or item.get("notice_date")
+                or item.get("display_time")
+                or item.get("date")
+                or ""
+            )[:10]
+        )
+        ann_type = str(item.get("NOTICE_TYPE") or item.get("notice_type") or item.get("column_name") or "")
+        art_code = item.get("art_code") or item.get("code") or item.get("NOTICE_CODE") or ""
+        url_out = ""
+        if art_code:
+            url_out = f"https://np-cnotice-fund.eastmoney.com/api/content/ann?art_code={art_code}"
+        rows.append(
+            {
+                "date": d,
+                "title": title[:200],
+                "type": ann_type,
+                "summary": _clip(f"{ann_type} {title}".strip(), max_chars),
+                "source": "东财基金公告",
+                "url": url_out,
+                "code": code,
+            }
+        )
+    return rows[:limit]
 
 
 def fetch_cninfo_announcements(
@@ -401,8 +507,68 @@ def fetch_macro_calendar(
                 "unit": item.get("unit") or None,
             }
         cursor = stop + timedelta(days=1)
-    out = sorted(rows.values(), key=lambda r: r["time"])
-    return _backfill_china_cpi_ppi(out)
+    out = list(rows.values())
+    out = _backfill_china_cpi_ppi(out)
+    # 默认：重要性降序，同重要性内按时间升序（保证高重要性不被尾部砍掉）
+    out.sort(key=lambda r: (-int(r.get("importance") or 0), str(r.get("time") or "")))
+    return out
+
+
+def prioritize_macro_calendar(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+    order_by: str = "importance_desc_time_asc",
+    slim: bool = False,
+    kind: str | None = None,
+) -> dict[str, Any]:
+    """宏观日历排序/截断元数据：禁止静默砍掉高重要性事件。"""
+    items = list(rows or [])
+    if kind in ("data", "event"):
+        items = [r for r in items if r.get("kind") == kind]
+    if order_by == "time_asc":
+        items.sort(key=lambda r: str(r.get("time") or ""))
+    else:
+        # importance_desc_time_asc：先保证 importance≥3 整段纳入，再按重要度/时间
+        items.sort(key=lambda r: (-int(r.get("importance") or 0), str(r.get("time") or "")))
+    total = len(items)
+    truncated = False
+    next_hint = None
+    if limit is not None and limit > 0 and total > limit:
+        # 优先保留高重要性：先取 importance>=3，再按序补齐到 limit
+        high = [r for r in items if int(r.get("importance") or 0) >= 3]
+        rest = [r for r in items if int(r.get("importance") or 0) < 3]
+        picked = list(high)
+        if len(picked) > limit:
+            picked = picked[:limit]
+        else:
+            need = limit - len(picked)
+            picked.extend(rest[:need])
+        # 保持 importance desc + time asc
+        picked.sort(key=lambda r: (-int(r.get("importance") or 0), str(r.get("time") or "")))
+        truncated = True
+        next_hint = {
+            "suggested_days_ahead_extra": 7,
+            "omitted_count": total - len(picked),
+            "omitted_high_importance": max(0, len(high) - sum(
+                1 for r in picked if int(r.get("importance") or 0) >= 3
+            )),
+        }
+        items = picked
+    if slim:
+        slim_keys = ("time", "country", "title", "importance", "actual_status", "actual", "kind")
+        items = [{k: r.get(k) for k in slim_keys} for r in items]
+    times = [str(r.get("time") or "")[:10] for r in items if r.get("time")]
+    return {
+        "items": items,
+        "truncated": truncated,
+        "returned_count": len(items),
+        "total_count": total,
+        "window_start": min(times) if times else None,
+        "window_end": max(times) if times else None,
+        "order_by": order_by,
+        "next_cursor": next_hint,
+    }
 
 
 def _parse_cn_month_from_macro_title(title: str, event_time: str) -> str | None:

@@ -56,6 +56,22 @@ def migrate_schema() -> None:
                 ("investment_decisions", "usage_notes", "JSONB"),
                 ("experiences", "fingerprint", "VARCHAR(200)"),
                 ("experiences", "updated_at", "TIMESTAMPTZ"),
+                ("orders", "rationale", "TEXT"),
+                ("orders", "confidence", "DOUBLE PRECISION"),
+                ("orders", "verify_spec", "JSONB"),
+                ("trades", "rationale", "TEXT"),
+                ("trades", "confidence", "DOUBLE PRECISION"),
+                ("trades", "verify_spec", "JSONB"),
+                ("trades", "verify_due_date", "DATE"),
+                ("trades", "verify_status", "VARCHAR(32)"),
+                ("trades", "verify_eval", "JSONB"),
+                ("trades", "verify_outcome", "TEXT"),
+                ("trades", "verify_lesson", "TEXT"),
+                ("trades", "verified_at", "TIMESTAMPTZ"),
+                ("trades", "verified_review_id", "INTEGER"),
+                ("settlements", "open_basis_date", "DATE"),
+                ("settlements", "open_basis_stale", "BOOLEAN"),
+                ("settlements", "attribution", "JSONB"),
             )
             for table, column, col_type in wanted:
                 try:
@@ -110,6 +126,44 @@ def migrate_schema() -> None:
                 conn.execute(text("ALTER TABLE experiences ADD COLUMN fingerprint VARCHAR(200)"))
             if "updated_at" not in exp_cols:
                 conn.execute(text("ALTER TABLE experiences ADD COLUMN updated_at DATETIME"))
+            order_cols = {
+                row[1] for row in conn.execute(text("PRAGMA table_info(orders)")).fetchall()
+            }
+            for col, decl in (
+                ("rationale", "TEXT"),
+                ("confidence", "FLOAT"),
+                ("verify_spec", "JSON"),
+            ):
+                if col not in order_cols:
+                    conn.execute(text(f"ALTER TABLE orders ADD COLUMN {col} {decl}"))
+            trade_cols = {
+                row[1] for row in conn.execute(text("PRAGMA table_info(trades)")).fetchall()
+            }
+            for col, decl in (
+                ("rationale", "TEXT"),
+                ("confidence", "FLOAT"),
+                ("verify_spec", "JSON"),
+                ("verify_due_date", "DATE"),
+                ("verify_status", "VARCHAR(32)"),
+                ("verify_eval", "JSON"),
+                ("verify_outcome", "TEXT"),
+                ("verify_lesson", "TEXT"),
+                ("verified_at", "DATETIME"),
+                ("verified_review_id", "INTEGER"),
+            ):
+                if col not in trade_cols:
+                    conn.execute(text(f"ALTER TABLE trades ADD COLUMN {col} {decl}"))
+            settle_cols = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(settlements)")).fetchall()
+            }
+            for col, decl in (
+                ("open_basis_date", "DATE"),
+                ("open_basis_stale", "BOOLEAN DEFAULT 0"),
+                ("attribution", "JSON"),
+            ):
+                if col not in settle_cols:
+                    conn.execute(text(f"ALTER TABLE settlements ADD COLUMN {col} {decl}"))
         for sql in (
             "UPDATE change_requests SET status = 'pending_dev' WHERE status = 'approved'",
             "UPDATE change_requests SET status = 'completed' WHERE status = 'implemented'",

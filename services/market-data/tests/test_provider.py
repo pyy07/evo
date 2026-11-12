@@ -126,11 +126,19 @@ def test_mock_index_valuation_and_breadth():
     assert val["pe"] > 0
     assert val["pe_ttm"] > 0
     assert val["pe_percentile"] is not None
-    assert val["pb"] is None  # 中证估值文件不含 PB
-    assert val["pb_status"] == "unavailable"
-    assert val["pe_percentile_1y"] is None
+    assert val["pb"] is not None
+    assert val["pb_status"] == "ok"
+    assert val["pb_percentile_status"] == "unavailable"
+    assert val["pe_percentile_1y"] is not None
+    assert val["pe_percentile_3y"] is not None
+    assert val["pe_percentile_5y"] is not None
+    assert val["pe_percentile_long_basis"] == "csi_pe_ttm_history"
     assert val["pe_percentile_window_start"]
     assert val["pe_percentile_window_end"]
+    # 未在主指数快照覆盖内的代码：PB 仍 unavailable，但长窗口 PE 分位仍有
+    bare = p.get_index_valuation("000852")
+    assert bare["pb_status"] == "unavailable"
+    assert bare["pe_percentile_1y"] is not None
     breadth = p.get_market_breadth()
     assert breadth["up"] > 0
     assert any(x["label"] == "涨停" for x in breadth["histogram"])
@@ -149,17 +157,17 @@ def test_mock_index_valuation_and_breadth():
 def test_overview_filters_concept_noise_and_compacts():
     p = MarketDataProvider(mode="mock")
 
-    def noisy_concept(*, top_n=10, board="concept"):
+    def noisy_concept(*, top_n=10, board="concept", **_kwargs):
         return {
             "board": board,
             "top": [
-                {"rank": 1, "code": "BK0481", "name": "半导体", "change_pct": 2.0},
-                {"rank": 2, "code": "BK1645", "name": "昨日打二板以上表现", "change_pct": 3.0},
-                {"rank": 3, "code": "BK1675", "name": "历史新高", "change_pct": 2.5},
+                {"rank": 1, "code": "BK0481", "name": "半导体", "change_pct": 2.0, "member_count": 80, "low_sample": False},
+                {"rank": 2, "code": "BK1645", "name": "昨日打二板以上表现", "change_pct": 3.0, "member_count": 50, "low_sample": False},
+                {"rank": 3, "code": "BK1675", "name": "历史新高", "change_pct": 2.5, "member_count": 40, "low_sample": False},
             ],
             "bottom": [
-                {"rank": 99, "code": "BK1050", "name": "昨日涨停_含一字", "change_pct": -1},
-                {"rank": 98, "code": "BK1750", "name": "2026中报扭亏", "change_pct": -1.2},
+                {"rank": 99, "code": "BK1050", "name": "昨日涨停_含一字", "change_pct": -1, "member_count": 30, "low_sample": False},
+                {"rank": 98, "code": "BK1750", "name": "2026中报扭亏", "change_pct": -1.2, "member_count": 30, "low_sample": False},
             ],
             "total": 5,
             "filtered_noise": [
@@ -177,9 +185,9 @@ def test_overview_filters_concept_noise_and_compacts():
         else {
             "board": "industry",
             "top": [
-                {"rank": 1, "code": "BK01", "name": "焦炭II", "change_pct": 2},
-                {"rank": 2, "code": "BK02", "name": "焦炭III", "change_pct": 1.5},
-                {"rank": 3, "code": "BK03", "name": "银行", "change_pct": 1},
+                {"rank": 1, "code": "BK01", "name": "焦炭II", "change_pct": 2, "member_count": 40, "low_sample": False},
+                {"rank": 2, "code": "BK02", "name": "焦炭III", "change_pct": 1.5, "member_count": 20, "low_sample": False},
+                {"rank": 3, "code": "BK03", "name": "银行", "change_pct": 1, "member_count": 50, "low_sample": False},
             ],
             "bottom": [],
             "total": 3,
@@ -360,7 +368,30 @@ def test_mock_index_valuation_maps_dividend_index_name():
     val = p.get_index_valuation("000015")
     assert val["name"] == "红利指数"
     assert val["index_code"] == "000015"
+    assert val["pb_status"] == "ok"
+    assert val["pe_percentile_1y"] is not None
     assert "ulist_error" not in val or val.get("degraded") is True
+
+
+def test_pe_ttm_window_percentiles_helper():
+    from datetime import date, timedelta
+
+    from market_data import asd_core
+
+    end = date(2026, 10, 16)
+    hist = []
+    # 构造：近 1 年偏高、更早更低，使 latest 在 1y 低分位、全样本中位附近
+    for i in range(400):
+        d = end - timedelta(days=400 - i)
+        pe = 10.0 + (i / 400.0) * 5.0  # 10 → 15
+        hist.append({"date": d.isoformat(), "pe_ttm": pe})
+    hist.append({"date": end.isoformat(), "pe_ttm": 12.0})
+    pct = asd_core.pe_ttm_window_percentiles(hist, windows={"1y": 365, "3y": 365 * 3})
+    assert pct["pe_ttm"] == 12.0
+    assert pct["pe_percentile_long_basis"] == "csi_pe_ttm_history"
+    assert pct["pe_percentile_1y"] is not None
+    assert 0 <= pct["pe_percentile_1y"] <= 100
+    assert pct["pe_percentile_1y_sample_size"] >= 20
 
 
 def test_mock_macro_has_actual_status():
@@ -381,3 +412,136 @@ def test_num_or_none_cleans_eastmoney_dashes():
     assert MarketDataProvider._num_or_none("--") is None
     assert MarketDataProvider._num_or_none("16.21") == 16.21
     assert MarketDataProvider._num_or_none(0) == 0.0
+
+
+def test_mock_screen_etf_enriches_index_valuation():
+    p = MarketDataProvider(mode="mock")
+    etf = p.screen_market(stock_type="etf", top_n=30)
+    mapped = [c for c in etf["candidates"] if c.get("index_code")]
+    assert mapped, etf["candidates"][:3]
+    hit = mapped[0]
+    assert hit["pe_ttm"] is not None
+    assert hit.get("pe_ttm") != 0
+    assert hit["mapping_confidence"] == "exact"
+    assert hit["valuation_status"] in ("ok", "partial")
+    # 快照 0 不得当估值
+    assert all(c.get("pe_ttm") != 0 for c in etf["candidates"])
+
+
+def test_overview_min_member_skips_low_sample_main_board():
+    p = MarketDataProvider(mode="mock")
+
+    def tiny(**kwargs):
+        return {
+            "board": kwargs.get("board") or "industry",
+            "top": [
+                {
+                    "rank": 1,
+                    "code": "BK01",
+                    "name": "会展服务",
+                    "change_pct": 5,
+                    "up_count": 1,
+                    "down_count": 1,
+                    "member_count": 2,
+                    "low_sample": True,
+                },
+                {
+                    "rank": 2,
+                    "code": "BK02",
+                    "name": "电子",
+                    "change_pct": 3,
+                    "up_count": 40,
+                    "down_count": 20,
+                    "member_count": 60,
+                    "low_sample": False,
+                },
+            ],
+            "bottom": [],
+            "total": 2,
+        }
+
+    p.industry_comparison = tiny  # type: ignore[method-assign]
+    overview = p.get_market_overview(top_n=3, min_member_count=5)
+    leaders = [x["name"] for x in overview["industry"]["leaders"]]
+    assert "电子" in leaders
+    assert "会展服务" not in leaders
+    assert any(x["name"] == "会展服务" for x in overview["industry"]["raw_leaders"])
+    assert overview["industry"]["leaders"][0].get("member_count") == 60
+
+
+def test_mock_breadth_has_aggregates_and_as_of(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVO_BREADTH_CACHE", str(tmp_path / "breadth"))
+    # reload cache dir binding
+    import market_data.provider as prov
+
+    monkeypatch.setattr(prov, "_BREADTH_CACHE_DIR", tmp_path / "breadth")
+    p = MarketDataProvider(mode="mock")
+    b = p.get_market_breadth(days=1)
+    assert b["as_of"]
+    assert b["limit_up_total"] == 22
+    assert b["limit_down_total"] == 8
+    assert b["history_status"] == "ok"
+    b2 = p.get_market_breadth(days=5)
+    assert b2["history_status"] in ("ok", "partial")
+    assert len(b2["history"]) >= 2
+    overview = p.get_market_overview(top_n=3)
+    assert overview["breadth"]["as_of"]
+    assert overview["breadth"]["limit_down_total"] is not None
+
+
+def test_mock_macro_prioritizes_importance_and_meta():
+    from market_data.news import prioritize_macro_calendar
+
+    rows = [
+        {"time": "2026-10-20 10:00", "title": "低价值", "importance": 2, "kind": "data"},
+        {"time": "2026-10-25 22:00", "title": "FOMC", "importance": 4, "kind": "event"},
+        {"time": "2026-10-21 09:00", "title": "中价值", "importance": 2, "kind": "data"},
+        {"time": "2026-10-24 20:00", "title": "核心PCE", "importance": 3, "kind": "data"},
+    ]
+    out = prioritize_macro_calendar(rows, limit=2, order_by="importance_desc_time_asc")
+    assert out["truncated"] is True
+    titles = [x["title"] for x in out["items"]]
+    assert "FOMC" in titles
+    assert "核心PCE" in titles
+    assert "低价值" not in titles
+    dig = MarketDataProvider(mode="mock").get_macro_digest(days_ahead=5, limit=10)
+    assert dig["calendar_meta"]["returned_count"] == len(dig["calendar"])
+    assert dig["calendar"][0]["importance"] >= dig["calendar"][-1]["importance"]
+
+
+def test_mock_etf_premium_share_direction():
+    p = MarketDataProvider(mode="mock")
+    prem = p.get_etf_premium(["510300", "510330", "510050"])
+    assert "share_direction" in prem
+    assert prem["items"][0].get("index_code") in ("000300", "000016")
+    assert "technical_adjustment_flag" in prem["items"][0]
+
+
+def test_mock_index_valuation_dividend_caveat():
+    p = MarketDataProvider(mode="mock")
+    val = p.get_index_valuation("000015")
+    assert val["caveat"]
+    assert val["dy_percentile_1y"] is not None
+
+
+def test_series_window_percentiles_helper():
+    from datetime import date, timedelta
+
+    from market_data.asd_core import series_window_percentiles
+
+    today = date.today()
+    hist = [
+        {"date": (today - timedelta(days=i)).isoformat(), "dividend_yield": 3.0 + i * 0.01}
+        for i in range(40)
+    ]
+    hist.reverse()
+    out = series_window_percentiles(
+        hist,
+        value_key="dividend_yield",
+        prefix="dy_percentile",
+        min_samples=8,
+        basis="test",
+    )
+    assert out["dividend_yield"] is not None
+    assert out["dy_percentile_1y"] is not None
+    assert out["series"]
